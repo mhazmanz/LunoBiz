@@ -29,7 +29,6 @@ import traceback
 import typing as t
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlencode
 
 try:
     import tkinter as tk
@@ -48,13 +47,11 @@ except Exception as e:
 # =========================
 
 APP_NAME = "LunoBiz"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 DEFAULT_API_BASE = "https://api.luno.com"
 
-# Luno candles endpoint documented as:
+# Luno candles endpoint:
 # GET /api/exchange/1/candles?pair=...&since=...&duration=...
-# returns up to 1000 earliest candles from 'since'
-# Supported durations include 60, 300, 900, 1800, 3600, 86400, 604800, etc. :contentReference[oaicite:2]{index=2}
 CANDLES_PATH = "/api/exchange/1/candles"
 TICKER_PATH = "/api/1/ticker"
 TICKERS_PATH = "/api/1/tickers"
@@ -127,7 +124,7 @@ def fmt_money(x: float, currency: str = "MYR") -> str:
 
 def fmt_pct(x: float) -> str:
     try:
-        return f"{x*100:.2f}%"
+        return f"{x * 100:.2f}%"
     except Exception:
         return f"{x}"
 
@@ -152,8 +149,24 @@ def file_exists(path: Path) -> bool:
 
 
 def is_kill_switch_on(data_dir: Path) -> bool:
-    # If KILL_SWITCH file exists -> no trading
     return file_exists(data_dir / KILL_SWITCH_FILE)
+
+
+def open_folder_in_explorer(folder: Path) -> None:
+    """
+    Opens folder on Windows/macOS/Linux. Best effort; never raises.
+    """
+    try:
+        if not folder.exists():
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(str(folder))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            os.system(f'open "{folder}"')
+        else:
+            os.system(f'xdg-open "{folder}"')
+    except Exception:
+        pass
 
 
 # =========================
@@ -164,12 +177,6 @@ _ENV_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$")
 
 
 def load_dotenv(dotenv_path: Path) -> dict[str, str]:
-    """
-    Minimal .env parser:
-    - KEY=VALUE
-    - Allows quoted values "..."
-    - Ignores comments and blank lines
-    """
     env: dict[str, str] = {}
     if not dotenv_path.exists():
         return env
@@ -187,7 +194,6 @@ def load_dotenv(dotenv_path: Path) -> dict[str, str]:
         if not m:
             continue
         k, v = m.group(1), m.group(2).strip()
-        # strip inline comment (naive) only if not quoted
         if v and not (v.startswith('"') and v.endswith('"')) and "#" in v:
             v = v.split("#", 1)[0].strip()
         if v.startswith('"') and v.endswith('"'):
@@ -209,7 +215,6 @@ def get_env(key: str, fallback: str = "") -> str:
 
 @dataclass(frozen=True)
 class AppConfig:
-    # Secrets are loaded at runtime; never store real keys in repo
     luno_api_key_readonly: str
     luno_api_secret_readonly: str
     luno_api_key_live: str
@@ -218,17 +223,17 @@ class AppConfig:
     telegram_bot_token: str
     telegram_chat_id: str
 
-    app_mode: str  # PAPER or LIVE (LIVE still locked behind gates)
+    app_mode: str  # PAPER or LIVE
 
     default_view_pair: str
-    scan_pairs_csv: str  # comma-separated; empty => auto-discover from /api/1/tickers
+    scan_pairs_csv: str
 
     risk_per_trade: float
     daily_loss_cap: float
     max_open_positions: int
     cooldown_minutes: int
 
-    backtest_timeframe: str  # like 1m, 5m, 1h, 1d
+    backtest_timeframe: str
     backtest_slippage_bps: float
     backtest_fee_bps: float
 
@@ -267,11 +272,6 @@ def timeframe_to_seconds(tf: str) -> int:
 
 
 def load_config(repo_root: Path, log: "AppLogger") -> AppConfig:
-    """
-    Load config from:
-    1) .env (repo_root/.env) if exists
-    2) environment variables override
-    """
     dotenv_path = repo_root / ".env"
     dotenv = load_dotenv(dotenv_path)
     for k, v in dotenv.items():
@@ -322,7 +322,7 @@ def load_config(repo_root: Path, log: "AppLogger") -> AppConfig:
 
 
 # =========================
-# Logging (thread-safe; GUI-friendly)
+# Logging
 # =========================
 
 class AppLogger:
@@ -339,7 +339,6 @@ class AppLogger:
             with self._log_file.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
-            # last resort: don't crash on logging
             pass
 
     def info(self, msg: str) -> None:
@@ -444,9 +443,6 @@ class Storage:
         self.log.info(f"SQLite ready: {self.db_path}")
 
     def upsert_candles(self, pair: str, duration_sec: int, candles: list[dict[str, t.Any]]) -> int:
-        """
-        candles items contain: timestamp(ms), open/high/low/close/volume as strings or numbers
-        """
         if not candles:
             return 0
         with self._lock:
@@ -561,25 +557,16 @@ class Notifier:
             self.log.exception("Telegram send exception", e)
 
     def notify(self, title: str, message: str) -> None:
-        # Telegram + log
         self.log.info(f"{title}: {message}")
         if self.telegram_enabled():
             self.send_telegram(f"{title}\n{message}")
 
 
 # =========================
-# Luno REST Client (requests)
+# Luno REST Client
 # =========================
 
 class LunoClient:
-    """
-    Requests-based client with:
-    - timeouts
-    - retry/backoff
-    - optional basic auth (key:secret)
-
-    Candles endpoint: GET /api/exchange/1/candles :contentReference[oaicite:3]{index=3}
-    """
     def __init__(self, cfg: AppConfig, log: AppLogger, use_live: bool):
         self.cfg = cfg
         self.log = log
@@ -610,8 +597,8 @@ class LunoClient:
                     r = requests.get(url, params=params, headers=headers, timeout=timeout)
                 else:
                     r = requests.post(url, params=params, data=data, headers=headers, timeout=timeout)
+
                 if r.status_code == 429:
-                    # rate limit - backoff and retry
                     self.log.warn(f"HTTP 429 rate-limited on {path}. attempt={attempt}/{retries}")
                     time.sleep(backoff * attempt + random.random() * 0.2)
                     continue
@@ -620,7 +607,6 @@ class LunoClient:
                     time.sleep(backoff * attempt)
                     continue
                 if r.status_code >= 400:
-                    # client error
                     raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
                 try:
                     return r.json()
@@ -632,8 +618,6 @@ class LunoClient:
                 time.sleep(backoff * attempt)
         raise RuntimeError(f"Request failed after retries: {path}. last={last_exc}")
 
-    # --- Public endpoints (no auth required, but we still allow auth header) ---
-
     def tickers(self) -> dict[str, t.Any]:
         return self._request("GET", TICKERS_PATH)
 
@@ -641,13 +625,10 @@ class LunoClient:
         return self._request("GET", TICKER_PATH, params={"pair": pair})
 
     def candles(self, pair: str, since_ms: int, duration_sec: int) -> dict[str, t.Any]:
-        # Luno requires since + duration + pair :contentReference[oaicite:4]{index=4}
         return self._request("GET", CANDLES_PATH, params={"pair": pair, "since": int(since_ms), "duration": int(duration_sec)})
 
     def orderbook(self, pair: str) -> dict[str, t.Any]:
         return self._request("GET", ORDERBOOK_PATH, params={"pair": pair})
-
-    # --- Auth endpoints ---
 
     def balance(self) -> dict[str, t.Any]:
         return self._request("GET", BALANCE_PATH)
@@ -659,8 +640,6 @@ class LunoClient:
         return self._request("GET", LIST_ORDERS_PATH, params=params)
 
     def post_order_limit(self, pair: str, side: str, volume: str, price: str) -> dict[str, t.Any]:
-        # WARNING: This places a live order if credentials are live.
-        # This scaffold exists; production will add further validation.
         data = {"pair": pair, "type": "LIMIT", "side": side, "volume": volume, "price": price}
         return self._request("POST", CREATE_ORDER_PATH, data=data)
 
@@ -669,7 +648,7 @@ class LunoClient:
 
 
 # =========================
-# Indicators (pure python)
+# Indicators
 # =========================
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -726,7 +705,7 @@ def atr(high: list[float], low: list[float], close: list[float], period: int = 1
 @dataclass
 class Signal:
     pair: str
-    action: str  # BUY/SELL/HOLD
+    action: str
     confidence: float
     reason: str
     stop_price: float | None = None
@@ -735,15 +714,6 @@ class Signal:
 
 
 class StrategyEngine:
-    """
-    Aggressive target system:
-    - Multi-regime heuristic scoring
-    - Produces signals + confidence
-
-    Notes:
-    - This is a framework. Profitability depends on market conditions and parameters.
-    - We will tune by walk-forward validation and gate live deployment.
-    """
     def __init__(self, cfg: AppConfig, log: AppLogger):
         self.cfg = cfg
         self.log = log
@@ -767,27 +737,19 @@ class StrategyEngine:
         vol = a[i] / max(1e-9, price)
         mom = (close[i] - close[i - 10]) / max(1e-9, close[i - 10])
 
-        # Regime heuristic:
-        # - Trend breakout mode when trend strong and RSI not extremely overbought
-        # - Mean reversion when trend weak and RSI extreme
         confidence = 0.0
         action = "HOLD"
         reason = "No edge detected"
 
-        # Aggressive bias: attempt to catch momentum + volatility expansion
-        # Hard filters to reduce worst entries
         if trend > 0.002 and mom > 0.003 and r[i] < 78:
-            # BUY signal
             action = "BUY"
             confidence = clamp(0.55 + trend * 40 + mom * 30 - vol * 2, 0.0, 0.95)
             reason = "Trend+momentum alignment"
         elif trend < -0.002 and mom < -0.003 and r[i] > 22:
-            # SELL/short not supported on spot; so HOLD (or exit if in position)
             action = "SELL"
             confidence = clamp(0.55 + abs(trend) * 40 + abs(mom) * 30 - vol * 2, 0.0, 0.95)
             reason = "Downtrend detected (exit/avoid)"
 
-        # Compute risk-based stop/take targets using ATR
         stop = None
         tp = None
         if action == "BUY":
@@ -829,16 +791,33 @@ class BacktestResult:
     notes: str
     equity_curve: list[tuple[int, float]]
 
+    def to_dict(self) -> dict[str, t.Any]:
+        return {
+            "pair": self.pair,
+            "timeframe": self.timeframe,
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "start_utc": human_ts(self.start_ms) if self.start_ms else "",
+            "end_utc": human_ts(self.end_ms) if self.end_ms else "",
+            "trades": self.trades,
+            "win_rate": self.win_rate,
+            "total_return": self.total_return,
+            "max_drawdown": self.max_drawdown,
+            "profit_factor": self.profit_factor,
+            "avg_trade_return": self.avg_trade_return,
+            "notes": self.notes,
+            "equity_curve": [{"ts_ms": ts, "ts_utc": human_ts(ts), "equity": eq} for ts, eq in self.equity_curve],
+        }
+
+    def summary_line(self) -> str:
+        return (
+            f"{self.pair} tf={self.timeframe} trades={self.trades} "
+            f"win={self.win_rate*100:.1f}% ret={self.total_return*100:.2f}% "
+            f"dd={self.max_drawdown*100:.2f}% notes={self.notes}"
+        )
+
 
 class Backtester:
-    """
-    Candle-based backtester:
-    - Simulates entries/exits on close
-    - Fees and slippage modeled in bps
-    - Produces metrics and equity curve
-
-    This is not a guarantee of live results.
-    """
     def __init__(self, cfg: AppConfig, log: AppLogger, storage: Storage, strategy: StrategyEngine):
         self.cfg = cfg
         self.log = log
@@ -846,7 +825,6 @@ class Backtester:
         self.strategy = strategy
 
     def _apply_costs(self, price: float, side: str) -> float:
-        # Simple slippage model: add slippage for buys, subtract for sells
         slip = self.cfg.backtest_slippage_bps / 10000.0
         if side.upper() == "BUY":
             return price * (1.0 + slip)
@@ -874,8 +852,6 @@ class Backtester:
         trades = 0
         wins = 0
 
-        # For speed, precompute signals every candle
-        # Use last N candles for strategy
         for i in range(80, len(candles)):
             window = candles[:i + 1]
             ts_ms = int(window[-1]["ts_ms"])
@@ -883,13 +859,7 @@ class Backtester:
 
             sig = self.strategy.generate_signal_from_candles(pair, window)
 
-            # Exit logic: if in position and SELL signal OR stop/tp hit
             if in_pos:
-                stop = sig.stop_price  # not perfect (signal computed on latest)
-                tp = sig.take_profit_price
-                # Use static ATR-based stop/tp derived from last candle indicators;
-                # for a more realistic model we would store stop/tp at entry.
-                # Here we approximate: exit when adverse move is large enough, or signal says SELL.
                 if sig.action == "SELL" and sig.confidence > 0.55:
                     exit_px = self._apply_costs(price, "SELL")
                     notional = qty * exit_px
@@ -907,8 +877,6 @@ class Backtester:
                     in_pos = False
                     qty = 0.0
                 else:
-                    # soft stop/tp approximation based on entry_price and ATR snapshot at entry is better;
-                    # for now: take profit if price moved +1.5% and stop if -1.0% (aggressive)
                     if price >= entry_price * 1.015:
                         exit_px = self._apply_costs(price, "SELL")
                         notional = qty * exit_px
@@ -942,22 +910,18 @@ class Backtester:
                         in_pos = False
                         qty = 0.0
 
-            # Entry logic: BUY signal with confidence threshold
             if not in_pos and sig.action == "BUY" and sig.confidence >= 0.60:
-                # Risk sizing: allocate a fraction of equity to position
-                # This is spot: we buy with cash. Use RISK_PER_TRADE as fraction allocated.
-                alloc = clamp(self.cfg.risk_per_trade * 10.0, 0.01, 0.35)  # aggressive scaling but capped
+                alloc = clamp(self.cfg.risk_per_trade * 10.0, 0.01, 0.35)
                 cash_to_use = equity * alloc
                 entry_px = self._apply_costs(price, "BUY")
                 if entry_px > 0 and cash_to_use > 1e-6:
                     qty = (cash_to_use / entry_px)
                     notional = qty * entry_px
                     fee = self._fee(notional)
-                    equity -= fee  # pay fee
+                    equity -= fee
                     entry_price = entry_px
                     in_pos = True
 
-            # Track equity curve and drawdown
             equity_curve.append((ts_ms, equity))
             peak = max(peak, equity)
             dd = (peak - equity) / max(1e-9, peak)
@@ -987,12 +951,6 @@ class Backtester:
         )
 
     def walk_forward(self, pair: str, candles: list[dict[str, float]], initial_equity: float = 100.0) -> BacktestResult:
-        """
-        Walk-forward structure (simple v1):
-        - Split candles into N windows
-        - Run run_single_pair on each window sequentially, compounding equity
-        - Aggregate metrics
-        """
         if len(candles) < 400:
             return self.run_single_pair(pair, candles, initial_equity)
 
@@ -1003,21 +961,16 @@ class Backtester:
         total_trades = 0
         weighted_wins = 0.0
         worst_dd = 0.0
-        gross_profit = 0.0
-        gross_loss = 0.0
         trade_returns: list[float] = []
 
         for w in range(n_windows):
             seg = candles[w * window: (w + 1) * window] if w < n_windows - 1 else candles[w * window:]
             res = self.run_single_pair(pair, seg, eq)
-            # approximate win aggregation
             total_trades += res.trades
             weighted_wins += res.win_rate * res.trades
             worst_dd = max(worst_dd, res.max_drawdown)
-            # rebuild equity by applying segment return
             eq = eq * (1.0 + res.total_return)
-            for ts, e in res.equity_curve:
-                all_curve.append((ts, e))
+            all_curve.extend(res.equity_curve)
             trade_returns.append(res.avg_trade_return)
 
         win_rate = (weighted_wins / total_trades) if total_trades > 0 else 0.0
@@ -1033,7 +986,7 @@ class Backtester:
             win_rate=win_rate,
             total_return=total_return,
             max_drawdown=worst_dd,
-            profit_factor=0.0,  # v1: not aggregated accurately
+            profit_factor=0.0,
             avg_trade_return=avg_tr,
             notes="Walk-forward OK",
             equity_curve=all_curve,
@@ -1087,8 +1040,6 @@ class TradingEngine:
 
         self.paper = PaperPortfolio(equity=100.0, cash=100.0)
 
-    # ----- Safety gates -----
-
     def live_unlocked(self) -> bool:
         unlock_file = self.cfg.data_dir / LIVE_MODE_UNLOCK_FILE
         gate = self.storage.get_gate("LIVE_GATE", "0")
@@ -1103,22 +1054,18 @@ class TradingEngine:
             return False
         return True
 
-    # ----- Pair discovery -----
-
     def get_scan_pairs(self) -> list[str]:
-        # user-defined list wins
         raw = (self.cfg.scan_pairs_csv or "").strip()
         if raw:
             pairs = [p.strip().upper() for p in raw.split(",") if p.strip()]
             return sorted(list(dict.fromkeys(pairs)))
 
-        # auto-discover from /api/1/tickers
         if self._pairs_cache:
             return self._pairs_cache[:]
 
         try:
             data = self._client_ro.tickers()
-            tickers = data.get("tickers") or data.get("tickers", [])
+            tickers = data.get("tickers") or []
             pairs: list[str] = []
             if isinstance(tickers, list):
                 for tkr in tickers:
@@ -1131,12 +1078,7 @@ class TradingEngine:
             self.log.warn(f"Failed to auto-discover pairs: {e}")
             return [self.cfg.default_view_pair.upper()]
 
-    # ----- Candle ingestion -----
-
     def ingest_candles(self, pair: str, duration_sec: int, start_ms: int, end_ms: int) -> int:
-        """
-        Pull candles in chunks of <=1000 (Luno returns up to 1000 earliest candles from since). :contentReference[oaicite:5]{index=5}
-        """
         total = 0
         since = start_ms
         while since < end_ms:
@@ -1147,12 +1089,9 @@ class TradingEngine:
             n = self.storage.upsert_candles(pair, duration_sec, candles)
             total += n
             last_ts = safe_int(candles[-1].get("timestamp"), since)
-            # advance at least one candle to avoid infinite loop
             since = max(last_ts + duration_sec * 1000, since + duration_sec * 1000)
-            # avoid hammering API
             time.sleep(0.15)
             if n < 5:
-                # likely near end
                 break
         return total
 
@@ -1169,8 +1108,6 @@ class TradingEngine:
                 "volume": float(r["volume"]),
             })
         return out
-
-    # ----- Backtest entrypoint -----
 
     def run_backtest(self, pairs: list[str], tf: str, days: int, initial_equity: float, walk_forward: bool) -> list[BacktestResult]:
         duration_sec = timeframe_to_seconds(tf)
@@ -1194,11 +1131,9 @@ class TradingEngine:
                 results.append(res)
             except Exception as e:
                 self.log.exception(f"Backtest failed for {pair}", e)
-        # sort by total return descending
+
         results.sort(key=lambda r: r.total_return, reverse=True)
         return results
-
-    # ----- Main loop scaffold (Paper trading only in v1) -----
 
     def start(self) -> None:
         with self._lock:
@@ -1219,7 +1154,6 @@ class TradingEngine:
             return self._running
 
     def _run_loop(self) -> None:
-        # Initialize paper portfolio day tracking
         self._paper_reset_day_if_needed()
 
         while self.running():
@@ -1229,20 +1163,16 @@ class TradingEngine:
                     time.sleep(1.0)
                     continue
 
-                # Health ping: ticker of default view pair
                 pair = self.cfg.default_view_pair.upper().strip()
                 tkr = self._client_ro.ticker(pair)
                 last_trade = safe_float(tkr.get("last_trade"), 0.0)
                 self._last_health = f"OK last={last_trade}"
 
-                # Paper mode trading loop:
                 if self.cfg.is_paper():
                     self._paper_reset_day_if_needed()
-                    # Minimal: only scan top N pairs and make decisions; no live trading here
-                    scan_pairs = self.get_scan_pairs()[:10]  # keep CPU low
+                    scan_pairs = self.get_scan_pairs()[:10]
                     self._paper_scan_and_maybe_trade(scan_pairs)
                 else:
-                    # LIVE scaffold: do nothing until gates + unlock
                     if self.allow_live():
                         self._last_health = "LIVE_UNLOCKED (not executing in v1)"
                     else:
@@ -1257,12 +1187,9 @@ class TradingEngine:
     def health(self) -> str:
         return self._last_health
 
-    # ----- Paper trading internals -----
-
     def _paper_reset_day_if_needed(self) -> None:
         day = now_utc().strftime("%Y-%m-%d")
         if self.paper.day_utc != day:
-            # new day: set start equity to current equity
             self.paper.day_utc = day
             self.paper.day_start_equity = self.paper.equity
             self.log.info(f"New UTC day: {day}. day_start_equity={self.paper.day_start_equity:.2f}")
@@ -1271,18 +1198,14 @@ class TradingEngine:
         return (self.paper.equity - self.paper.day_start_equity) / max(1e-9, self.paper.day_start_equity)
 
     def _paper_scan_and_maybe_trade(self, pairs: list[str]) -> None:
-        # Daily loss cap enforcement
         if self._paper_daily_pnl_pct() <= -abs(self.cfg.daily_loss_cap):
             self.notifier.notify("Daily halt", f"Daily loss cap hit. pnl={fmt_pct(self._paper_daily_pnl_pct())}. Cooling down.")
             time.sleep(self.cfg.cooldown_minutes * 60)
             return
 
-        # Aggressive target (3–5% daily):
-        # We still enforce max positions and sizing caps.
         if len(self.paper.positions) >= self.cfg.max_open_positions:
             return
 
-        # Build quick ranking by recent momentum (lightweight) then run strategy for top few
         ranked: list[tuple[float, str]] = []
         duration_sec = timeframe_to_seconds(self.cfg.backtest_timeframe)
         end_ms = utc_ms()
@@ -1290,7 +1213,6 @@ class TradingEngine:
 
         for p in pairs:
             try:
-                # Ingest a small amount of candles if missing
                 self.ingest_candles(p, duration_sec, start_ms, end_ms)
                 cs = self.load_candles_for_backtest(p, duration_sec, start_ms, end_ms)
                 if len(cs) < 80:
@@ -1317,7 +1239,6 @@ class TradingEngine:
                 meta=sig.meta
             )
             if sig.action == "BUY" and sig.confidence >= 0.65:
-                # Enter paper position
                 price = float(sig.meta.get("price", cs[-1]["close"]))
                 alloc = clamp(self.cfg.risk_per_trade * 10.0, 0.02, 0.35)
                 cash_to_use = self.paper.cash * alloc
@@ -1340,9 +1261,8 @@ class TradingEngine:
                     equity_after=self.paper.equity,
                     meta={"alloc": alloc, "confidence": sig.confidence, "reason": sig.reason}
                 )
-                break  # one entry per scan cycle for stability
+                break
 
-        # Manage exits (simple)
         to_close: list[str] = []
         for p, pos in self.paper.positions.items():
             try:
@@ -1350,7 +1270,6 @@ class TradingEngine:
                 price = safe_float(tkr.get("last_trade"), 0.0)
                 if price <= 0:
                     continue
-                # Aggressive exit targets: +1.5% TP, -1.0% SL
                 if price >= pos.entry_price * 1.015 or price <= pos.entry_price * 0.990:
                     notional = pos.qty * price
                     fee = notional * (self.cfg.backtest_fee_bps / 10000.0)
@@ -1378,6 +1297,80 @@ class TradingEngine:
 
 
 # =========================
+# Reporting (Backtest export)
+# =========================
+
+class ReportWriter:
+    def __init__(self, data_dir: Path, log: AppLogger):
+        self.data_dir = data_dir
+        self.log = log
+        self.reports_dir = data_dir / "reports"
+        ensure_dir(self.reports_dir)
+
+    def write_backtest_reports(
+        self,
+        results: list[BacktestResult],
+        context: dict[str, t.Any],
+    ) -> dict[str, Path]:
+        """
+        Writes:
+        - CSV (summary rows)
+        - JSON (full results incl equity curve)
+        - TXT (small summary for pasting)
+        Returns dict of produced paths.
+        """
+        stamp = now_utc().strftime("%Y%m%d_%H%M%S")
+        csv_path = self.reports_dir / f"backtest_{stamp}.csv"
+        json_path = self.reports_dir / f"backtest_{stamp}.json"
+        txt_path = self.reports_dir / f"backtest_{stamp}_summary.txt"
+
+        # CSV: summary only
+        try:
+            header = "pair,timeframe,start_utc,end_utc,trades,win_rate,total_return,max_drawdown,profit_factor,avg_trade_return,notes\n"
+            lines = [header]
+            for r in results:
+                lines.append(
+                    f"{r.pair},{r.timeframe},"
+                    f"\"{human_ts(r.start_ms)}\",\"{human_ts(r.end_ms)}\","
+                    f"{r.trades},{r.win_rate:.6f},{r.total_return:.6f},{r.max_drawdown:.6f},"
+                    f"{r.profit_factor:.6f},{r.avg_trade_return:.6f},\"{r.notes}\"\n"
+                )
+            csv_path.write_text("".join(lines), encoding="utf-8")
+        except Exception as e:
+            self.log.exception("Failed writing CSV report", e)
+
+        # JSON: context + full results
+        try:
+            payload = {
+                "generated_utc": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "context": context,
+                "results": [r.to_dict() for r in results],
+            }
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.log.exception("Failed writing JSON report", e)
+
+        # TXT: compact summary
+        try:
+            top_lines = []
+            top_lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
+            top_lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            for k, v in context.items():
+                top_lines.append(f"{k}: {v}")
+            top_lines.append("")
+            top_lines.append("Top Results:")
+            for r in results[:10]:
+                top_lines.append(" - " + r.summary_line())
+            txt_path.write_text("\n".join(top_lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            self.log.exception("Failed writing TXT report", e)
+
+        out = {"csv": csv_path, "json": json_path, "txt": txt_path}
+        self.log.info(f"Backtest reports saved: csv={csv_path} json={json_path} txt={txt_path}")
+        return out
+
+
+# =========================
 # GUI
 # =========================
 
@@ -1385,39 +1378,38 @@ class Dashboard(tk.Tk):
     def __init__(self, repo_root: Path):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1200x760")
-        self.minsize(1000, 650)
+        self.geometry("1250x780")
+        self.minsize(1050, 680)
 
         self.repo_root = repo_root
 
-        # logger + config + storage + notifier + engine
         self.log = AppLogger(data_dir=(repo_root / "data"))
         self.cfg = load_config(repo_root, self.log)
         ensure_dir(self.cfg.data_dir)
-        self.log = AppLogger(data_dir=self.cfg.data_dir)  # rebind to correct data dir after cfg load
+        self.log = AppLogger(data_dir=self.cfg.data_dir)
         self.cfg = load_config(repo_root, self.log)
 
         self.storage = Storage(self.cfg.data_dir / self.cfg.db_filename, self.log)
         self.notifier = Notifier(self.cfg, self.log)
         self.engine = TradingEngine(self.cfg, self.log, self.storage, self.notifier)
+        self.reports = ReportWriter(self.cfg.data_dir, self.log)
 
-        # UI state
         self._ui_queue: "queue.Queue[t.Callable[[], None]]" = queue.Queue()
         self._backtest_thread: threading.Thread | None = None
 
-        # Build layout
+        # Backtest output cache
+        self._last_backtest_results: list[BacktestResult] = []
+        self._last_backtest_context: dict[str, t.Any] = {}
+        self._last_backtest_report_paths: dict[str, Path] = {}
+
         self._build_style()
         self._build_widgets()
 
-        # periodic UI updates
         self.after(250, self._poll_logs)
         self.after(500, self._refresh_status)
         self.after(1000, self._drain_ui_queue)
 
-        # On close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Safety warning in GUI (no false promises)
         self._show_startup_notice()
 
     def _build_style(self) -> None:
@@ -1428,7 +1420,6 @@ class Dashboard(tk.Tk):
             pass
 
     def _build_widgets(self) -> None:
-        # Top toolbar
         top = ttk.Frame(self, padding=8)
         top.pack(side=tk.TOP, fill=tk.X)
 
@@ -1455,7 +1446,6 @@ class Dashboard(tk.Tk):
 
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=8, pady=4)
 
-        # Main split
         main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
@@ -1464,7 +1454,6 @@ class Dashboard(tk.Tk):
         main.add(left, weight=3)
         main.add(right, weight=2)
 
-        # Left: tables
         self.tbl_positions = self._make_table(
             left,
             title="Open Positions (Paper)",
@@ -1475,11 +1464,10 @@ class Dashboard(tk.Tk):
         self.tbl_rank = self._make_table(
             left,
             title="Scanner / Latest Decisions",
-            columns=[("time", 160), ("pair", 90), ("action", 80), ("conf", 80), ("reason", 320)]
+            columns=[("time", 160), ("pair", 90), ("action", 80), ("conf", 80), ("reason", 340)]
         )
         self.tbl_rank.pack(fill=tk.BOTH, expand=True)
 
-        # Right: controls + logs
         controls = ttk.LabelFrame(right, text="Controls", padding=10)
         controls.pack(fill=tk.X, pady=(0, 8))
 
@@ -1496,7 +1484,6 @@ class Dashboard(tk.Tk):
 
         ttk.Separator(controls, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
 
-        # Backtest section
         bt = ttk.LabelFrame(right, text="Backtest", padding=10)
         bt.pack(fill=tk.X, pady=(0, 8))
 
@@ -1522,22 +1509,25 @@ class Dashboard(tk.Tk):
         ttk.Entry(row2, textvariable=self.var_bt_equity, width=10).pack(side=tk.LEFT, padx=8)
 
         row3 = ttk.Frame(bt)
-        row3.pack(fill=tk.X)
+        row3.pack(fill=tk.X, pady=(0, 6))
 
         self.var_bt_walk = tk.BooleanVar(value=True)
         ttk.Checkbutton(row3, text="Walk-forward", variable=self.var_bt_walk).pack(side=tk.LEFT)
 
         ttk.Button(row3, text="Run Backtest", command=self._run_backtest).pack(side=tk.LEFT, padx=10)
 
-        # Backtest results table
+        # New: export/copy buttons
+        ttk.Button(row3, text="Copy Summary", command=self._copy_backtest_summary).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row3, text="Export Backtest Report", command=self._export_backtest_report).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row3, text="Open Reports Folder", command=self._open_reports_folder).pack(side=tk.LEFT)
+
         self.tbl_bt = self._make_table(
             right,
             title="Backtest Results (sorted by return)",
-            columns=[("pair", 90), ("tf", 60), ("trades", 70), ("win", 70), ("ret", 90), ("dd", 80), ("notes", 220)]
+            columns=[("pair", 90), ("tf", 60), ("trades", 70), ("win", 70), ("ret", 90), ("dd", 80), ("notes", 230)]
         )
         self.tbl_bt.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
-        # Logs
         logs = ttk.LabelFrame(right, text="Logs", padding=8)
         logs.pack(fill=tk.BOTH, expand=True)
 
@@ -1578,7 +1568,6 @@ class Dashboard(tk.Tk):
         self.log.info("GUI requested engine stop")
 
     def _export_logs(self) -> None:
-        # Export log file to chosen path
         src = self.cfg.data_dir / "lunobiz.log"
         if not src.exists():
             messagebox.showwarning("Export Logs", "Log file not found yet.")
@@ -1595,6 +1584,57 @@ class Dashboard(tk.Tk):
             messagebox.showinfo("Export Logs", f"Exported to: {dst}")
         except Exception as e:
             messagebox.showerror("Export Logs", f"Failed: {e}")
+
+    def _open_reports_folder(self) -> None:
+        open_folder_in_explorer(self.reports.reports_dir)
+
+    def _copy_backtest_summary(self) -> None:
+        if not self._last_backtest_results:
+            messagebox.showwarning("Copy Summary", "Run a backtest first.")
+            return
+        summary = self._compose_backtest_summary_text()
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(summary)
+            self.update()  # keep clipboard after app exits
+            messagebox.showinfo("Copy Summary", "Copied backtest summary to clipboard. Paste it into chat.")
+        except Exception as e:
+            messagebox.showerror("Copy Summary", f"Failed: {e}")
+
+    def _compose_backtest_summary_text(self) -> str:
+        ctx = self._last_backtest_context or {}
+        lines = []
+        lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
+        lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        for k, v in ctx.items():
+            lines.append(f"{k}: {v}")
+        lines.append("")
+        lines.append("Top Results:")
+        for r in self._last_backtest_results[:10]:
+            lines.append(" - " + r.summary_line())
+        if self._last_backtest_report_paths:
+            lines.append("")
+            lines.append("Latest report files:")
+            for k, p in self._last_backtest_report_paths.items():
+                lines.append(f" - {k}: {p}")
+        return "\n".join(lines)
+
+    def _export_backtest_report(self) -> None:
+        if not self._last_backtest_results:
+            messagebox.showwarning("Export Backtest Report", "Run a backtest first.")
+            return
+        try:
+            paths = self.reports.write_backtest_reports(self._last_backtest_results, self._last_backtest_context)
+            self._last_backtest_report_paths = paths
+            messagebox.showinfo(
+                "Export Backtest Report",
+                "Saved CSV/JSON/TXT reports.\n\n"
+                f"CSV: {paths.get('csv')}\n"
+                f"JSON: {paths.get('json')}\n"
+                f"TXT: {paths.get('txt')}\n"
+            )
+        except Exception as e:
+            messagebox.showerror("Export Backtest Report", f"Failed: {e}")
 
     def _run_backtest(self) -> None:
         if self._backtest_thread and self._backtest_thread.is_alive():
@@ -1616,14 +1656,33 @@ class Dashboard(tk.Tk):
             try:
                 self.log.info(f"Backtest start: pairs={pairs} tf={tf} days={days} equity={eq} walk={walk}")
                 res = self.engine.run_backtest(pairs=pairs, tf=tf, days=days, initial_equity=eq, walk_forward=walk)
+
+                # cache results and context for export/copy
+                ctx = {
+                    "pairs": ",".join(pairs),
+                    "timeframe": tf,
+                    "days": days,
+                    "initial_equity": eq,
+                    "walk_forward": walk,
+                    "slippage_bps": self.cfg.backtest_slippage_bps,
+                    "fee_bps": self.cfg.backtest_fee_bps,
+                }
+                self._last_backtest_results = res
+                self._last_backtest_context = ctx
+                self._last_backtest_report_paths = {}
+
                 self._ui_queue.put(lambda: self._render_backtest_results(res))
-                # Set a simple gate if results are strong (conservative default gate)
-                # You can tighten these gates later.
+
+                # Gate example (conservative): keep locked unless strong
                 if res:
                     top = res[0]
                     gate_ok = (top.total_return > 0.10 and top.max_drawdown < 0.20 and top.trades >= 10)
                     self.engine.storage.set_gate("LIVE_GATE", "1" if gate_ok else "0")
-                    self.log.info(f"Gate eval: top_return={fmt_pct(top.total_return)} dd={fmt_pct(top.max_drawdown)} trades={top.trades} -> LIVE_GATE={int(gate_ok)}")
+                    self.log.info(
+                        f"Gate eval: top_return={fmt_pct(top.total_return)} dd={fmt_pct(top.max_drawdown)} "
+                        f"trades={top.trades} -> LIVE_GATE={int(gate_ok)}"
+                    )
+
             except Exception as e:
                 self.log.exception("Backtest worker failed", e)
 
@@ -1640,9 +1699,9 @@ class Dashboard(tk.Tk):
                 r.pair,
                 r.timeframe,
                 r.trades,
-                f"{r.win_rate*100:.1f}%",
-                f"{r.total_return*100:.1f}%",
-                f"{r.max_drawdown*100:.1f}%",
+                f"{r.win_rate * 100:.1f}%",
+                f"{r.total_return * 100:.1f}%",
+                f"{r.max_drawdown * 100:.1f}%",
                 r.notes
             ))
 
@@ -1660,7 +1719,6 @@ class Dashboard(tk.Tk):
             self.var_mode.set(self.cfg.app_mode.upper())
             self.var_health.set(self.engine.health())
 
-            # Paper portfolio values
             eq = self.engine.paper.equity
             cash = self.engine.paper.cash
             self.var_equity.set(fmt_money(eq, "MYR"))
@@ -1681,7 +1739,7 @@ class Dashboard(tk.Tk):
 
         for p, pos in self.engine.paper.positions.items():
             age_s = max(0, int((utc_ms() - pos.entry_ts_ms) / 1000))
-            age = f"{age_s//3600:02d}:{(age_s%3600)//60:02d}:{age_s%60:02d}"
+            age = f"{age_s // 3600:02d}:{(age_s % 3600) // 60:02d}:{age_s % 60:02d}"
             tree.insert("", tk.END, values=(
                 p,
                 f"{pos.qty:.6f}",
@@ -1690,7 +1748,6 @@ class Dashboard(tk.Tk):
             ))
 
     def _render_recent_decisions(self) -> None:
-        # lightweight: show last few decisions from DB
         tree: ttk.Treeview = self.tbl_rank.tree  # type: ignore[attr-defined]
         for item in tree.get_children():
             tree.delete(item)
@@ -1717,7 +1774,6 @@ class Dashboard(tk.Tk):
                     r["reason"]
                 ))
         except Exception:
-            # ignore DB read errors in UI
             pass
 
     def _drain_ui_queue(self) -> None:
@@ -1746,14 +1802,12 @@ class Dashboard(tk.Tk):
 # =========================
 
 def find_repo_root() -> Path:
-    # Assume file lives in repo root
     here = Path(__file__).resolve()
     return here.parent
 
 
 def main() -> int:
     repo_root = find_repo_root()
-    # Ensure data dir exists early
     ensure_dir(repo_root / "data")
     app = Dashboard(repo_root)
     app.mainloop()
