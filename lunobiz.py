@@ -1,12 +1,17 @@
 """
-LunoBiz - Single-file Windows application
-- GUI dashboard (no charts; values and tables only)
-- Backtesting + walk-forward validation
-- Paper trading engine (default)
-- Live trading scaffold with strict safety locks
+LunoBiz - Single-file Windows application (v0.2.0)
+
+Key features:
+- GUI dashboard (values & tables only)
+- Robust candle caching in SQLite
+- Backtesting with walk-forward validation
+- Paper trading engine
+- Paper-only leverage simulation (no live execution)
+- R-based risk sizing, partial exits, trailing stops, liquidation simulation
+- Safety controls: kill switch, live gate (still locked by default)
 
 Public-repo safe:
-- No secrets hard-coded
+- No secrets in code
 - Reads secrets from .env (git-ignored) or environment variables
 """
 
@@ -47,24 +52,24 @@ except Exception as e:
 # =========================
 
 APP_NAME = "LunoBiz"
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.2.0"
 DEFAULT_API_BASE = "https://api.luno.com"
 
-# Luno candles endpoint:
-# GET /api/exchange/1/candles?pair=...&since=...&duration=...
+# Luno endpoints
 CANDLES_PATH = "/api/exchange/1/candles"
 TICKER_PATH = "/api/1/ticker"
 TICKERS_PATH = "/api/1/tickers"
-ORDERBOOK_PATH = "/api/1/orderbook"
 BALANCE_PATH = "/api/1/balance"
-LIST_TRADES_PATH = "/api/1/trades"
 LIST_ORDERS_PATH = "/api/1/listorders"
 CREATE_ORDER_PATH = "/api/1/postorder"
 STOP_ORDER_PATH = "/api/1/stoporder"
 
-# Safety: never live trade unless explicitly enabled and gates pass
-LIVE_MODE_UNLOCK_FILE = "LIVE_UNLOCK.ok"  # local file toggle (not tracked)
-KILL_SWITCH_FILE = "KILL_SWITCH"          # if present => trading disabled immediately
+# Safety toggles (local files, not tracked)
+LIVE_MODE_UNLOCK_FILE = "LIVE_UNLOCK.ok"
+KILL_SWITCH_FILE = "KILL_SWITCH"
+
+# Reporting
+REPORTS_DIRNAME = "reports"
 
 
 # =========================
@@ -141,21 +146,14 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def file_exists(path: Path) -> bool:
+def is_kill_switch_on(data_dir: Path) -> bool:
     try:
-        return path.exists()
+        return (data_dir / KILL_SWITCH_FILE).exists()
     except Exception:
         return False
 
 
-def is_kill_switch_on(data_dir: Path) -> bool:
-    return file_exists(data_dir / KILL_SWITCH_FILE)
-
-
 def open_folder_in_explorer(folder: Path) -> None:
-    """
-    Opens folder on Windows/macOS/Linux. Best effort; never raises.
-    """
     try:
         if not folder.exists():
             return
@@ -210,46 +208,8 @@ def get_env(key: str, fallback: str = "") -> str:
 
 
 # =========================
-# Config
+# Timeframes
 # =========================
-
-@dataclass(frozen=True)
-class AppConfig:
-    luno_api_key_readonly: str
-    luno_api_secret_readonly: str
-    luno_api_key_live: str
-    luno_api_secret_live: str
-
-    telegram_bot_token: str
-    telegram_chat_id: str
-
-    app_mode: str  # PAPER or LIVE
-
-    default_view_pair: str
-    scan_pairs_csv: str
-
-    risk_per_trade: float
-    daily_loss_cap: float
-    max_open_positions: int
-    cooldown_minutes: int
-
-    backtest_timeframe: str
-    backtest_slippage_bps: float
-    backtest_fee_bps: float
-
-    data_dir: Path
-    db_filename: str
-
-    poll_interval_seconds: int
-    http_timeout_seconds: int = 15
-    http_max_retries: int = 4
-
-    def is_paper(self) -> bool:
-        return self.app_mode.strip().upper() == "PAPER"
-
-    def is_live(self) -> bool:
-        return self.app_mode.strip().upper() == "LIVE"
-
 
 def timeframe_to_seconds(tf: str) -> int:
     tf = (tf or "").strip().lower()
@@ -269,56 +229,6 @@ def timeframe_to_seconds(tf: str) -> int:
     if unit == "w":
         return n * 604800
     return 300
-
-
-def load_config(repo_root: Path, log: "AppLogger") -> AppConfig:
-    dotenv_path = repo_root / ".env"
-    dotenv = load_dotenv(dotenv_path)
-    for k, v in dotenv.items():
-        if os.environ.get(k) is None:
-            os.environ[k] = v
-
-    def envf(k: str, default: str = "") -> str:
-        return get_env(k, default)
-
-    data_dir = Path(envf("DATA_DIR", "data")).expanduser()
-    if not data_dir.is_absolute():
-        data_dir = repo_root / data_dir
-
-    cfg = AppConfig(
-        luno_api_key_readonly=envf("LUNO_API_KEY_READONLY", ""),
-        luno_api_secret_readonly=envf("LUNO_API_SECRET_READONLY", ""),
-        luno_api_key_live=envf("LUNO_API_KEY_LIVE", ""),
-        luno_api_secret_live=envf("LUNO_API_SECRET_LIVE", ""),
-
-        telegram_bot_token=envf("TELEGRAM_BOT_TOKEN", ""),
-        telegram_chat_id=envf("TELEGRAM_CHAT_ID", ""),
-
-        app_mode=envf("APP_MODE", "PAPER"),
-
-        default_view_pair=envf("DEFAULT_VIEW_PAIR", "ETHMYR"),
-        scan_pairs_csv=envf("SCAN_PAIRS", ""),
-
-        risk_per_trade=safe_float(envf("RISK_PER_TRADE", "0.005"), 0.005),
-        daily_loss_cap=safe_float(envf("DAILY_LOSS_CAP", "0.02"), 0.02),
-        max_open_positions=max(1, safe_int(envf("MAX_OPEN_POSITIONS", "2"), 2)),
-        cooldown_minutes=max(1, safe_int(envf("COOLDOWN_MINUTES", "240"), 240)),
-
-        backtest_timeframe=envf("BACKTEST_TIMEFRAME", "5m"),
-        backtest_slippage_bps=safe_float(envf("BACKTEST_SLIPPAGE_BPS", "8"), 8.0),
-        backtest_fee_bps=safe_float(envf("BACKTEST_FEE_BPS", "30"), 30.0),
-
-        data_dir=data_dir,
-        db_filename=envf("DB_FILENAME", "lunobiz.sqlite3"),
-
-        poll_interval_seconds=max(2, safe_int(envf("POLL_INTERVAL_SECONDS", "10"), 10)),
-        http_timeout_seconds=max(5, safe_int(envf("HTTP_TIMEOUT_SECONDS", "15"), 15)),
-        http_max_retries=max(1, safe_int(envf("HTTP_MAX_RETRIES", "4"), 4)),
-    )
-
-    ensure_dir(cfg.data_dir)
-    log.info(f"Config loaded. mode={cfg.app_mode.upper()} data_dir={cfg.data_dir}")
-    return cfg
 
 
 # =========================
@@ -362,6 +272,119 @@ class AppLogger:
             except queue.Empty:
                 break
         return items
+
+
+# =========================
+# Config
+# =========================
+
+@dataclass(frozen=True)
+class AppConfig:
+    luno_api_key_readonly: str
+    luno_api_secret_readonly: str
+    luno_api_key_live: str
+    luno_api_secret_live: str
+
+    telegram_bot_token: str
+    telegram_chat_id: str
+
+    app_mode: str  # PAPER or LIVE
+
+    default_view_pair: str
+    scan_pairs_csv: str
+
+    # Portfolio risk controls
+    risk_per_trade: float           # fraction of equity risked to stop (e.g. 0.005 = 0.5%)
+    daily_loss_cap: float           # fraction of equity (e.g. 0.02 = 2% daily max loss)
+    max_open_positions: int
+    cooldown_minutes: int
+
+    # Backtest parameters
+    backtest_timeframe: str         # entry timeframe
+    signal_timeframe: str           # higher timeframe for regime
+    backtest_slippage_bps: float
+    backtest_fee_bps: float
+
+    # Paper leverage simulation
+    leverage_enabled_paper: bool
+    leverage_max: float             # hard cap
+    leverage_min: float             # typically 1
+    margin_alloc_cap: float         # cap margin usage fraction of equity per position
+    maint_margin_ratio: float       # simplistic maintenance margin ratio
+
+    data_dir: Path
+    db_filename: str
+
+    poll_interval_seconds: int
+    http_timeout_seconds: int = 15
+    http_max_retries: int = 4
+
+    def is_paper(self) -> bool:
+        return self.app_mode.strip().upper() == "PAPER"
+
+    def is_live(self) -> bool:
+        return self.app_mode.strip().upper() == "LIVE"
+
+
+def load_config(repo_root: Path, log: AppLogger) -> AppConfig:
+    dotenv_path = repo_root / ".env"
+    dotenv = load_dotenv(dotenv_path)
+    for k, v in dotenv.items():
+        if os.environ.get(k) is None:
+            os.environ[k] = v
+
+    def envs(k: str, default: str = "") -> str:
+        return get_env(k, default)
+
+    data_dir = Path(envs("DATA_DIR", "data")).expanduser()
+    if not data_dir.is_absolute():
+        data_dir = repo_root / data_dir
+
+    cfg = AppConfig(
+        luno_api_key_readonly=envs("LUNO_API_KEY_READONLY", ""),
+        luno_api_secret_readonly=envs("LUNO_API_SECRET_READONLY", ""),
+        luno_api_key_live=envs("LUNO_API_KEY_LIVE", ""),
+        luno_api_secret_live=envs("LUNO_API_SECRET_LIVE", ""),
+
+        telegram_bot_token=envs("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=envs("TELEGRAM_CHAT_ID", ""),
+
+        app_mode=envs("APP_MODE", "PAPER"),
+
+        default_view_pair=envs("DEFAULT_VIEW_PAIR", "ETHMYR"),
+        scan_pairs_csv=envs("SCAN_PAIRS", ""),
+
+        risk_per_trade=safe_float(envs("RISK_PER_TRADE", "0.005"), 0.005),
+        daily_loss_cap=safe_float(envs("DAILY_LOSS_CAP", "0.02"), 0.02),
+        max_open_positions=max(1, safe_int(envs("MAX_OPEN_POSITIONS", "2"), 2)),
+        cooldown_minutes=max(1, safe_int(envs("COOLDOWN_MINUTES", "240"), 240)),
+
+        backtest_timeframe=envs("BACKTEST_TIMEFRAME", "15m"),
+        signal_timeframe=envs("SIGNAL_TIMEFRAME", "1h"),
+        backtest_slippage_bps=safe_float(envs("BACKTEST_SLIPPAGE_BPS", "8"), 8.0),
+        backtest_fee_bps=safe_float(envs("BACKTEST_FEE_BPS", "30"), 30.0),
+
+        leverage_enabled_paper=(envs("PAPER_LEVERAGE_ENABLED", "1").strip() not in ("0", "false", "False")),
+        leverage_max=clamp(safe_float(envs("PAPER_LEVERAGE_MAX", "3.0"), 3.0), 1.0, 10.0),
+        leverage_min=clamp(safe_float(envs("PAPER_LEVERAGE_MIN", "1.0"), 1.0), 1.0, 10.0),
+        margin_alloc_cap=clamp(safe_float(envs("MARGIN_ALLOC_CAP", "0.60"), 0.60), 0.05, 0.95),
+        maint_margin_ratio=clamp(safe_float(envs("MAINT_MARGIN_RATIO", "0.35"), 0.35), 0.05, 0.95),
+
+        data_dir=data_dir,
+        db_filename=envs("DB_FILENAME", "lunobiz.sqlite3"),
+
+        poll_interval_seconds=max(2, safe_int(envs("POLL_INTERVAL_SECONDS", "10"), 10)),
+        http_timeout_seconds=max(5, safe_int(envs("HTTP_TIMEOUT_SECONDS", "15"), 15)),
+        http_max_retries=max(1, safe_int(envs("HTTP_MAX_RETRIES", "4"), 4)),
+    )
+
+    ensure_dir(cfg.data_dir)
+    log.info(
+        f"Config loaded. mode={cfg.app_mode.upper()} data_dir={cfg.data_dir} "
+        f"bt_tf={cfg.backtest_timeframe} signal_tf={cfg.signal_timeframe} "
+        f"paper_leverage={'ON' if cfg.leverage_enabled_paper else 'OFF'}"
+    )
+    return cfg
 
 
 # =========================
@@ -419,16 +442,6 @@ class Storage:
                     fee REAL NOT NULL,
                     equity_after REAL NOT NULL,
                     meta_json TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS metrics_daily (
-                    day_utc TEXT PRIMARY KEY,
-                    equity_start REAL NOT NULL,
-                    equity_end REAL NOT NULL,
-                    pnl REAL NOT NULL,
-                    pnl_pct REAL NOT NULL,
-                    max_drawdown REAL NOT NULL,
-                    notes TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS gates (
@@ -627,9 +640,6 @@ class LunoClient:
     def candles(self, pair: str, since_ms: int, duration_sec: int) -> dict[str, t.Any]:
         return self._request("GET", CANDLES_PATH, params={"pair": pair, "since": int(since_ms), "duration": int(duration_sec)})
 
-    def orderbook(self, pair: str) -> dict[str, t.Any]:
-        return self._request("GET", ORDERBOOK_PATH, params={"pair": pair})
-
     def balance(self) -> dict[str, t.Any]:
         return self._request("GET", BALANCE_PATH)
 
@@ -698,103 +708,358 @@ def atr(high: list[float], low: list[float], close: list[float], period: int = 1
     return ema(tr, period)
 
 
+def adx(high: list[float], low: list[float], close: list[float], period: int = 14) -> list[float]:
+    """
+    Wilder's ADX implementation (sufficient for regime filtering).
+    Returns list aligned to inputs length, using 0 until enough data accumulates.
+    """
+    n = len(close)
+    if n < period * 3:
+        return [0.0] * n
+
+    plus_dm = [0.0] * n
+    minus_dm = [0.0] * n
+    tr = [0.0] * n
+
+    for i in range(1, n):
+        up = high[i] - high[i - 1]
+        dn = low[i - 1] - low[i]
+        plus_dm[i] = up if (up > dn and up > 0) else 0.0
+        minus_dm[i] = dn if (dn > up and dn > 0) else 0.0
+        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
+
+    def wilder_smooth(series: list[float], p: int) -> list[float]:
+        out = [0.0] * n
+        s = sum(series[1:p + 1])
+        out[p] = s
+        for i in range(p + 1, n):
+            out[i] = out[i - 1] - (out[i - 1] / p) + series[i]
+        return out
+
+    atr_s = wilder_smooth(tr, period)
+    pdm_s = wilder_smooth(plus_dm, period)
+    mdm_s = wilder_smooth(minus_dm, period)
+
+    pdi = [0.0] * n
+    mdi = [0.0] * n
+    dx = [0.0] * n
+    for i in range(period, n):
+        denom = atr_s[i] if atr_s[i] != 0 else 1e-12
+        pdi[i] = 100.0 * (pdm_s[i] / denom)
+        mdi[i] = 100.0 * (mdm_s[i] / denom)
+        d = pdi[i] + mdi[i]
+        dx[i] = 100.0 * (abs(pdi[i] - mdi[i]) / (d if d != 0 else 1e-12))
+
+    # ADX is Wilder's smoothing of DX
+    adx_out = [0.0] * n
+    start = period * 2
+    adx_out[start] = sum(dx[period + 1:start + 1]) / period
+    for i in range(start + 1, n):
+        adx_out[i] = ((adx_out[i - 1] * (period - 1)) + dx[i]) / period
+
+    return adx_out
+
+
 # =========================
-# Strategy / Scoring
+# Candle helpers
 # =========================
 
 @dataclass
-class Signal:
+class CandleSeries:
     pair: str
-    action: str
+    tf: str
+    duration_sec: int
+    ts: list[int]
+    o: list[float]
+    h: list[float]
+    l: list[float]
+    c: list[float]
+    v: list[float]
+
+
+def build_series_from_rows(pair: str, tf: str, duration_sec: int, rows: list[sqlite3.Row]) -> CandleSeries:
+    ts: list[int] = []
+    o: list[float] = []
+    h: list[float] = []
+    l: list[float] = []
+    c: list[float] = []
+    v: list[float] = []
+    for r in rows:
+        ts.append(int(r["ts_ms"]))
+        o.append(float(r["open"]))
+        h.append(float(r["high"]))
+        l.append(float(r["low"]))
+        c.append(float(r["close"]))
+        v.append(float(r["volume"]))
+    return CandleSeries(pair=pair, tf=tf, duration_sec=duration_sec, ts=ts, o=o, h=h, l=l, c=c, v=v)
+
+
+def find_last_index_leq(ts_list: list[int], t_ms: int) -> int:
+    """
+    Binary search: last index where ts <= t_ms, else -1.
+    """
+    lo, hi = 0, len(ts_list) - 1
+    ans = -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if ts_list[mid] <= t_ms:
+            ans = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return ans
+
+
+# =========================
+# Strategy v0.2 (MTF regime + pullback entry)
+# =========================
+
+@dataclass
+class RegimeState:
+    direction: int   # +1 uptrend, -1 downtrend, 0 neutral
+    strength: float  # 0..1
+    adx: float
+    atr_pct: float
+
+
+@dataclass
+class EntrySignal:
+    action: str      # BUY/HOLD
     confidence: float
     reason: str
-    stop_price: float | None = None
-    take_profit_price: float | None = None
-    meta: dict[str, t.Any] = dataclasses.field(default_factory=dict)
+    leverage: float
+    stop_price: float
+    r_value: float
+    meta: dict[str, t.Any]
 
 
-class StrategyEngine:
+class StrategyV2:
+    """
+    MT regime on signal TF (default 1h):
+    - EMA50/EMA200 + slope confirmation
+    - ADX threshold for trending regime
+    - ATR% band to avoid dead chop or extreme spikes
+
+    Entry TF (default 15m):
+    - Pullback into EMA50 with trend still intact
+    - RSI guard to avoid overextension
+    """
     def __init__(self, cfg: AppConfig, log: AppLogger):
         self.cfg = cfg
         self.log = log
 
-    def generate_signal_from_candles(self, pair: str, candles: list[dict[str, float]]) -> Signal:
-        if len(candles) < 80:
-            return Signal(pair=pair, action="HOLD", confidence=0.0, reason="Insufficient candle history")
+    def compute_regime(self, sig: CandleSeries) -> list[RegimeState]:
+        if len(sig.c) < 250:
+            return [RegimeState(direction=0, strength=0.0, adx=0.0, atr_pct=0.0) for _ in sig.c]
 
-        close = [c["close"] for c in candles]
-        high_ = [c["high"] for c in candles]
-        low_ = [c["low"] for c in candles]
+        ema50 = ema(sig.c, 50)
+        ema200 = ema(sig.c, 200)
+        a = atr(sig.h, sig.l, sig.c, 14)
+        adxv = adx(sig.h, sig.l, sig.c, 14)
 
-        ema_fast = ema(close, 12)
-        ema_slow = ema(close, 26)
+        out: list[RegimeState] = []
+        for i in range(len(sig.c)):
+            price = sig.c[i]
+            if i < 210:
+                out.append(RegimeState(direction=0, strength=0.0, adx=0.0, atr_pct=0.0))
+                continue
+
+            trend = 0
+            if ema50[i] > ema200[i] * 1.001:
+                trend = +1
+            elif ema50[i] < ema200[i] * 0.999:
+                trend = -1
+
+            # Slope proxy: compare EMA50 now vs 20 bars ago
+            slope = (ema50[i] - ema50[i - 20]) / max(1e-12, ema50[i - 20])
+            slope_strength = clamp(abs(slope) * 200.0, 0.0, 1.0)
+
+            adx_strength = clamp((adxv[i] - 15.0) / 25.0, 0.0, 1.0)  # 15..40 mapped
+
+            atr_pct = (a[i] / max(1e-12, price)) if price > 0 else 0.0
+
+            # Strength is blended but penalize if ATR% extreme
+            vol_penalty = 0.0
+            # Ideal ATR% band roughly 0.3% .. 2.5% on higher TF (varies, but good general band)
+            if atr_pct < 0.0025:
+                vol_penalty = clamp((0.0025 - atr_pct) / 0.0025, 0.0, 1.0) * 0.6
+            elif atr_pct > 0.03:
+                vol_penalty = clamp((atr_pct - 0.03) / 0.03, 0.0, 1.0) * 0.7
+
+            strength = clamp(0.55 * adx_strength + 0.45 * slope_strength - vol_penalty, 0.0, 1.0)
+
+            out.append(RegimeState(direction=trend, strength=strength, adx=adxv[i], atr_pct=atr_pct))
+
+        return out
+
+    def choose_leverage(self, regime: RegimeState, equity_dd: float) -> float:
+        """
+        Conservative dynamic leverage:
+        - base 1x
+        - scale with regime strength
+        - reduce in drawdown
+        - hard cap at cfg.leverage_max
+        """
+        if not self.cfg.leverage_enabled_paper:
+            return 1.0
+
+        base = 1.0
+        add = 0.0
+
+        # Only consider >1x in strong trending regime
+        if regime.direction != 0 and regime.strength >= 0.55 and regime.adx >= 18.0:
+            add = 2.0 * clamp((regime.strength - 0.55) / 0.45, 0.0, 1.0)  # up to +2.0
+
+        lev = base + add
+
+        # Drawdown dampener (equity_dd = current drawdown fraction, 0..1)
+        if equity_dd > 0.02:
+            lev *= clamp(1.0 - (equity_dd * 6.0), 0.35, 1.0)
+
+        lev = clamp(lev, self.cfg.leverage_min, self.cfg.leverage_max)
+        return float(lev)
+
+    def entry_signal(
+        self,
+        pair: str,
+        entry: CandleSeries,
+        idx_entry: int,
+        sig: CandleSeries,
+        idx_sig: int,
+        regime: RegimeState,
+        equity_dd: float,
+    ) -> EntrySignal:
+        """
+        Long-only (spot-like), leverage simulated by margin rules.
+        """
+        # Regime must be uptrend
+        if regime.direction != +1 or regime.strength < 0.45 or regime.adx < 16.0:
+            return EntrySignal(
+                action="HOLD", confidence=0.0,
+                reason="Regime not trending up",
+                leverage=1.0, stop_price=0.0, r_value=0.0, meta={"regime": dataclasses.asdict(regime)}
+            )
+
+        # Need enough entry TF candles
+        if idx_entry < 120:
+            return EntrySignal(
+                action="HOLD", confidence=0.0,
+                reason="Insufficient entry TF history",
+                leverage=1.0, stop_price=0.0, r_value=0.0, meta={"regime": dataclasses.asdict(regime)}
+            )
+
+        # Entry indicators
+        close = entry.c[:idx_entry + 1]
+        high = entry.h[:idx_entry + 1]
+        low = entry.l[:idx_entry + 1]
+
+        ema50 = ema(close, 50)
+        ema200 = ema(close, 200)
         r = rsi(close, 14)
-        a = atr(high_, low_, close, 14)
+        a = atr(high, low, close, 14)
 
-        i = len(close) - 1
-        price = close[i]
-        trend = (ema_fast[i] - ema_slow[i]) / max(1e-9, ema_slow[i])
-        vol = a[i] / max(1e-9, price)
-        mom = (close[i] - close[i - 10]) / max(1e-9, close[i - 10])
+        price = close[-1]
+        if price <= 0:
+            return EntrySignal("HOLD", 0.0, "Bad price", 1.0, 0.0, 0.0, {"regime": dataclasses.asdict(regime)})
 
-        confidence = 0.0
-        action = "HOLD"
-        reason = "No edge detected"
+        # Trend alignment on entry TF too
+        if ema50[-1] <= ema200[-1] * 1.000:
+            return EntrySignal("HOLD", 0.0, "Entry TF trend not aligned", 1.0, 0.0, 0.0, {"regime": dataclasses.asdict(regime)})
 
-        if trend > 0.002 and mom > 0.003 and r[i] < 78:
-            action = "BUY"
-            confidence = clamp(0.55 + trend * 40 + mom * 30 - vol * 2, 0.0, 0.95)
-            reason = "Trend+momentum alignment"
-        elif trend < -0.002 and mom < -0.003 and r[i] > 22:
-            action = "SELL"
-            confidence = clamp(0.55 + abs(trend) * 40 + abs(mom) * 30 - vol * 2, 0.0, 0.95)
-            reason = "Downtrend detected (exit/avoid)"
+        # Pullback condition: price near EMA50 (not too far above)
+        dist_to_ema50 = (price - ema50[-1]) / max(1e-12, ema50[-1])
+        if dist_to_ema50 > 0.012:
+            return EntrySignal("HOLD", 0.0, "Overextended (too far above EMA50)", 1.0, 0.0, 0.0, {"dist_to_ema50": dist_to_ema50})
 
-        stop = None
-        tp = None
-        if action == "BUY":
-            stop = price - 2.2 * a[i]
-            tp = price + 3.2 * a[i]
-        elif action == "SELL":
-            stop = price + 2.2 * a[i]
-            tp = price - 3.2 * a[i]
+        # Avoid entering during extreme RSI (overheated)
+        if r[-1] >= 72.0:
+            return EntrySignal("HOLD", 0.0, "RSI too high (overheated)", 1.0, 0.0, 0.0, {"rsi": r[-1]})
 
-        meta = {
-            "price": price,
-            "ema_fast": ema_fast[i],
-            "ema_slow": ema_slow[i],
-            "trend": trend,
-            "rsi": r[i],
-            "atr": a[i],
-            "volatility": vol,
-            "momentum_10": mom,
-        }
-        return Signal(pair=pair, action=action, confidence=float(confidence), reason=reason, stop_price=stop, take_profit_price=tp, meta=meta)
+        # Volatility sanity on entry TF
+        atr_now = a[-1]
+        atr_pct = atr_now / max(1e-12, price)
+        if atr_pct < 0.0012:
+            return EntrySignal("HOLD", 0.0, "ATR% too low (chop risk)", 1.0, 0.0, 0.0, {"atr_pct": atr_pct})
+        if atr_pct > 0.06:
+            return EntrySignal("HOLD", 0.0, "ATR% too high (spike risk)", 1.0, 0.0, 0.0, {"atr_pct": atr_pct})
+
+        # Define stop distance using ATR
+        stop_dist = 1.25 * atr_now
+        stop_price = price - stop_dist
+        if stop_price <= 0:
+            return EntrySignal("HOLD", 0.0, "Invalid stop price", 1.0, 0.0, 0.0, {"atr": atr_now})
+
+        r_value = price - stop_price  # 1R in price terms
+
+        # Fee-aware minimum R gate: ensure 1R is large enough vs costs
+        # Approx cost (fees+slippage) in price terms for round-trip: bps_total * price
+        bps_total = (self.cfg.backtest_fee_bps + self.cfg.backtest_slippage_bps) / 10000.0
+        est_round_trip_cost = price * bps_total * 2.2  # slightly padded
+        if r_value < est_round_trip_cost * 1.4:
+            return EntrySignal(
+                "HOLD", 0.0,
+                "R too small vs estimated costs",
+                1.0, 0.0, 0.0,
+                {"r_value": r_value, "est_cost": est_round_trip_cost, "price": price}
+            )
+
+        # Confidence derived from regime strength + pullback proximity + RSI
+        proximity = clamp(1.0 - abs(dist_to_ema50) / 0.012, 0.0, 1.0)
+        rsi_score = clamp((72.0 - r[-1]) / 22.0, 0.0, 1.0)
+        conf = clamp(0.45 + 0.40 * regime.strength + 0.20 * proximity + 0.10 * rsi_score, 0.0, 0.95)
+
+        lev = self.choose_leverage(regime, equity_dd)
+
+        return EntrySignal(
+            action="BUY",
+            confidence=float(conf),
+            reason="MTF uptrend + pullback",
+            leverage=float(lev),
+            stop_price=float(stop_price),
+            r_value=float(r_value),
+            meta={
+                "price": price,
+                "ema50": ema50[-1],
+                "ema200": ema200[-1],
+                "rsi": r[-1],
+                "atr": atr_now,
+                "atr_pct": atr_pct,
+                "dist_to_ema50": dist_to_ema50,
+                "regime": dataclasses.asdict(regime),
+                "equity_dd": equity_dd,
+            }
+        )
 
 
 # =========================
-# Backtesting
+# Backtesting (v0.2)
 # =========================
 
 @dataclass
 class BacktestResult:
     pair: str
-    timeframe: str
+    entry_tf: str
+    signal_tf: str
     start_ms: int
     end_ms: int
+
     trades: int
     win_rate: float
     total_return: float
     max_drawdown: float
+
     profit_factor: float
     avg_trade_return: float
+
     notes: str
     equity_curve: list[tuple[int, float]]
+    extra: dict[str, t.Any] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> dict[str, t.Any]:
         return {
             "pair": self.pair,
-            "timeframe": self.timeframe,
+            "entry_tf": self.entry_tf,
+            "signal_tf": self.signal_tf,
             "start_ms": self.start_ms,
             "end_ms": self.end_ms,
             "start_utc": human_ts(self.start_ms) if self.start_ms else "",
@@ -806,25 +1071,48 @@ class BacktestResult:
             "profit_factor": self.profit_factor,
             "avg_trade_return": self.avg_trade_return,
             "notes": self.notes,
+            "extra": self.extra,
             "equity_curve": [{"ts_ms": ts, "ts_utc": human_ts(ts), "equity": eq} for ts, eq in self.equity_curve],
         }
 
     def summary_line(self) -> str:
         return (
-            f"{self.pair} tf={self.timeframe} trades={self.trades} "
+            f"{self.pair} entry={self.entry_tf} signal={self.signal_tf} trades={self.trades} "
             f"win={self.win_rate*100:.1f}% ret={self.total_return*100:.2f}% "
             f"dd={self.max_drawdown*100:.2f}% notes={self.notes}"
         )
 
 
-class Backtester:
-    def __init__(self, cfg: AppConfig, log: AppLogger, storage: Storage, strategy: StrategyEngine):
+@dataclass
+class SimPosition:
+    pair: str
+    qty: float
+    entry_price: float
+    stop_price: float
+    r_value: float
+    leverage: float
+    margin_used: float
+    entry_ts_ms: int
+
+    # exit management
+    took_partial: bool = False
+    qty_remaining: float = 0.0
+    trail_stop: float = 0.0
+
+
+class BacktesterV2:
+    """
+    Long-only with paper leverage simulation.
+    - Position sized by risk_per_trade: risk amount equals max loss at stop.
+    - Leverage affects margin used; liquidation if loss exceeds margin_used*(1-maint_margin_ratio).
+    - Partial exit at +1R; move stop to breakeven; trailing stop thereafter.
+    """
+    def __init__(self, cfg: AppConfig, log: AppLogger, strategy: StrategyV2):
         self.cfg = cfg
         self.log = log
-        self.storage = storage
         self.strategy = strategy
 
-    def _apply_costs(self, price: float, side: str) -> float:
+    def _apply_slippage(self, price: float, side: str) -> float:
         slip = self.cfg.backtest_slippage_bps / 10000.0
         if side.upper() == "BUY":
             return price * (1.0 + slip)
@@ -833,39 +1121,102 @@ class Backtester:
     def _fee(self, notional: float) -> float:
         return notional * (self.cfg.backtest_fee_bps / 10000.0)
 
-    def run_single_pair(self, pair: str, candles: list[dict[str, float]], initial_equity: float = 100.0) -> BacktestResult:
-        if len(candles) < 100:
-            return BacktestResult(pair, self.cfg.backtest_timeframe, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, "Insufficient candles", [])
+    def _liquidation_price_long(self, pos: SimPosition) -> float:
+        """
+        Simplified liquidation:
+        - Liquidation occurs when equity in position <= maintenance margin.
+        - Here we approximate using margin_used and maint_margin_ratio.
+        - loss_at_liq = margin_used * (1 - maint_margin_ratio)
+        """
+        loss_cap = pos.margin_used * (1.0 - self.cfg.maint_margin_ratio)
+        if pos.qty <= 0 or pos.entry_price <= 0:
+            return 0.0
+        return max(0.0, pos.entry_price - (loss_cap / pos.qty))
+
+    def run(
+        self,
+        pair: str,
+        entry: CandleSeries,
+        signal: CandleSeries,
+        regime_series: list[RegimeState],
+        initial_equity: float = 100.0
+    ) -> BacktestResult:
+        if len(entry.c) < 400 or len(signal.c) < 260 or len(regime_series) != len(signal.c):
+            return BacktestResult(
+                pair=pair, entry_tf=entry.tf, signal_tf=signal.tf,
+                start_ms=0, end_ms=0,
+                trades=0, win_rate=0.0, total_return=0.0, max_drawdown=0.0,
+                profit_factor=0.0, avg_trade_return=0.0,
+                notes="Insufficient candles",
+                equity_curve=[]
+            )
 
         equity = float(initial_equity)
         peak = equity
         max_dd = 0.0
 
-        in_pos = False
-        entry_price = 0.0
-        qty = 0.0
+        pos: SimPosition | None = None
+
+        trades = 0
+        wins = 0
         trade_returns: list[float] = []
         gross_profit = 0.0
         gross_loss = 0.0
 
-        equity_curve: list[tuple[int, float]] = []
-        trades = 0
-        wins = 0
+        eq_curve: list[tuple[int, float]] = []
 
-        for i in range(80, len(candles)):
-            window = candles[:i + 1]
-            ts_ms = int(window[-1]["ts_ms"])
-            price = float(window[-1]["close"])
+        # For drawdown-based leverage control, compute current dd from peak
+        def equity_drawdown() -> float:
+            return (peak - equity) / max(1e-12, peak)
 
-            sig = self.strategy.generate_signal_from_candles(pair, window)
+        # Determine mapping from entry candle -> signal candle index
+        # We'll compute regime using last signal candle <= entry timestamp.
+        for i in range(0, len(entry.ts)):
+            ts = entry.ts[i]
+            idx_sig = find_last_index_leq(signal.ts, ts)
+            if idx_sig < 0:
+                continue
+            regime = regime_series[idx_sig]
 
-            if in_pos:
-                if sig.action == "SELL" and sig.confidence > 0.55:
-                    exit_px = self._apply_costs(price, "SELL")
-                    notional = qty * exit_px
+            price = entry.c[i]
+            hi = entry.h[i]
+            lo = entry.l[i]
+            if price <= 0:
+                continue
+
+            # Update open position (check liquidation, stops, trailing, partial)
+            if pos is not None:
+                # Liquidation check (intrabar): if low breaches liq price
+                liq_px = self._liquidation_price_long(pos)
+                if liq_px > 0 and lo <= liq_px:
+                    # Liquidated at liq_px with slippage on sell
+                    exit_px = self._apply_slippage(liq_px, "SELL")
+                    notional = pos.qty_remaining * exit_px
                     fee = self._fee(notional)
-                    pnl = (exit_px - entry_price) * qty - fee
-                    ret = pnl / max(1e-9, equity)
+                    pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
+
+                    # Equity loses the margin used (conservative), plus pnl impact already reflected by mark-to-market.
+                    # We model it directly:
+                    equity += pnl
+                    trades += 1
+                    gross_loss += abs(pnl) if pnl < 0 else 0.0
+                    gross_profit += pnl if pnl > 0 else 0.0
+                    trade_returns.append(pnl / max(1e-12, equity))
+                    pos = None
+
+                    # After liquidation, halt further trading for this run (risk realism)
+                    eq_curve.append((ts, equity))
+                    peak = max(peak, equity)
+                    max_dd = max(max_dd, equity_drawdown())
+                    break
+
+                # Stop logic (intrabar): if low <= stop / trailing stop
+                active_stop = max(pos.stop_price, pos.trail_stop)
+                if lo <= active_stop:
+                    exit_px = self._apply_slippage(active_stop, "SELL")
+                    notional = pos.qty_remaining * exit_px
+                    fee = self._fee(notional)
+                    pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
                     equity += pnl
                     trades += 1
                     if pnl > 0:
@@ -873,71 +1224,159 @@ class Backtester:
                         gross_profit += pnl
                     else:
                         gross_loss += abs(pnl)
-                    trade_returns.append(ret)
-                    in_pos = False
-                    qty = 0.0
+                    trade_returns.append(pnl / max(1e-12, equity))
+                    pos = None
                 else:
-                    if price >= entry_price * 1.015:
-                        exit_px = self._apply_costs(price, "SELL")
-                        notional = qty * exit_px
+                    # Partial take at +1R (intrabar high check)
+                    tp1 = pos.entry_price + 1.0 * pos.r_value
+                    if (not pos.took_partial) and hi >= tp1:
+                        # Take 30% off at tp1
+                        take_qty = pos.qty_remaining * 0.30
+                        exit_px = self._apply_slippage(tp1, "SELL")
+                        notional = take_qty * exit_px
                         fee = self._fee(notional)
-                        pnl = (exit_px - entry_price) * qty - fee
-                        ret = pnl / max(1e-9, equity)
+                        pnl = (exit_px - pos.entry_price) * take_qty - fee
                         equity += pnl
-                        trades += 1
-                        if pnl > 0:
-                            wins += 1
-                            gross_profit += pnl
-                        else:
-                            gross_loss += abs(pnl)
-                        trade_returns.append(ret)
-                        in_pos = False
-                        qty = 0.0
-                    elif price <= entry_price * 0.990:
-                        exit_px = self._apply_costs(price, "SELL")
-                        notional = qty * exit_px
-                        fee = self._fee(notional)
-                        pnl = (exit_px - entry_price) * qty - fee
-                        ret = pnl / max(1e-9, equity)
-                        equity += pnl
-                        trades += 1
-                        if pnl > 0:
-                            wins += 1
-                            gross_profit += pnl
-                        else:
-                            gross_loss += abs(pnl)
-                        trade_returns.append(ret)
-                        in_pos = False
-                        qty = 0.0
 
-            if not in_pos and sig.action == "BUY" and sig.confidence >= 0.60:
-                alloc = clamp(self.cfg.risk_per_trade * 10.0, 0.01, 0.35)
-                cash_to_use = equity * alloc
-                entry_px = self._apply_costs(price, "BUY")
-                if entry_px > 0 and cash_to_use > 1e-6:
-                    qty = (cash_to_use / entry_px)
+                        pos.qty_remaining = max(0.0, pos.qty_remaining - take_qty)
+                        pos.took_partial = True
+
+                        # Move stop to breakeven
+                        pos.stop_price = max(pos.stop_price, pos.entry_price)
+
+                        # Initialize trailing stop a bit under price using ATR from entry TF window
+                        # Use last computed ATR approx from last 14 candles ending at i
+                        if i >= 20:
+                            a = atr(entry.h[max(0, i - 80):i + 1], entry.l[max(0, i - 80):i + 1], entry.c[max(0, i - 80):i + 1], 14)
+                            atr_now = a[-1] if a else 0.0
+                            pos.trail_stop = max(pos.trail_stop, price - 2.2 * atr_now)
+
+                    # Trailing update if in profit and partial taken
+                    if pos is not None and pos.took_partial and pos.qty_remaining > 0:
+                        # Update trailing using ATR (short window, efficient)
+                        if i >= 20:
+                            a = atr(entry.h[max(0, i - 80):i + 1], entry.l[max(0, i - 80):i + 1], entry.c[max(0, i - 80):i + 1], 14)
+                            atr_now = a[-1] if a else 0.0
+                            if atr_now > 0:
+                                new_trail = price - 2.4 * atr_now
+                                pos.trail_stop = max(pos.trail_stop, new_trail)
+
+                    # Regime invalidation exit (close remainder if regime flips)
+                    if pos is not None and regime.direction != +1 and pos.qty_remaining > 0:
+                        exit_px = self._apply_slippage(price, "SELL")
+                        notional = pos.qty_remaining * exit_px
+                        fee = self._fee(notional)
+                        pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
+                        equity += pnl
+                        trades += 1
+                        if pnl > 0:
+                            wins += 1
+                            gross_profit += pnl
+                        else:
+                            gross_loss += abs(pnl)
+                        trade_returns.append(pnl / max(1e-12, equity))
+                        pos = None
+
+            # Entry logic if flat
+            if pos is None:
+                # Daily loss cap proxy in backtest: stop entering if big drawdown
+                if equity_drawdown() >= 0.25:
+                    # too damaged; stop trading to avoid unrealistic recovery assumptions
+                    eq_curve.append((ts, equity))
+                    break
+
+                # Need enough entry candles to compute signal
+                idx_sig = find_last_index_leq(signal.ts, ts)
+                if idx_sig < 0:
+                    eq_curve.append((ts, equity))
+                    continue
+                regime = regime_series[idx_sig]
+
+                es = self.strategy.entry_signal(
+                    pair=pair,
+                    entry=entry,
+                    idx_entry=i,
+                    sig=signal,
+                    idx_sig=idx_sig,
+                    regime=regime,
+                    equity_dd=equity_drawdown(),
+                )
+
+                if es.action == "BUY" and es.confidence >= 0.62:
+                    # Position sizing:
+                    # risk_amount is max loss at stop (RISK_PER_TRADE * equity)
+                    risk_amount = equity * clamp(self.cfg.risk_per_trade, 0.0005, 0.05)
+                    stop_dist = max(1e-9, (entry.c[i] - es.stop_price))
+                    qty = risk_amount / stop_dist  # because loss_at_stop = stop_dist * qty
+
+                    # Apply leverage by margin:
+                    lev = es.leverage if self.cfg.leverage_enabled_paper else 1.0
+                    lev = clamp(lev, self.cfg.leverage_min, self.cfg.leverage_max)
+
+                    entry_px = self._apply_slippage(entry.c[i], "BUY")
                     notional = qty * entry_px
-                    fee = self._fee(notional)
-                    equity -= fee
-                    entry_price = entry_px
-                    in_pos = True
 
-            equity_curve.append((ts_ms, equity))
+                    if notional <= 0:
+                        eq_curve.append((ts, equity))
+                        continue
+
+                    margin_required = notional / lev
+                    margin_cap = equity * self.cfg.margin_alloc_cap
+
+                    # Scale down if margin exceeds cap
+                    if margin_required > margin_cap:
+                        scale = margin_cap / max(1e-12, margin_required)
+                        qty *= scale
+                        notional = qty * entry_px
+                        margin_required = notional / lev
+
+                    # Minimum notional sanity
+                    if notional < max(5.0, equity * 0.02):
+                        eq_curve.append((ts, equity))
+                        continue
+
+                    # Pay fee on entry
+                    entry_fee = self._fee(notional)
+                    equity -= entry_fee
+
+                    # Create position
+                    pos = SimPosition(
+                        pair=pair,
+                        qty=qty,
+                        entry_price=entry_px,
+                        stop_price=es.stop_price,
+                        r_value=es.r_value,
+                        leverage=lev,
+                        margin_used=margin_required,
+                        entry_ts_ms=ts,
+                        took_partial=False,
+                        qty_remaining=qty,
+                        trail_stop=0.0,
+                    )
+
+            # equity curve and drawdown
+            eq_curve.append((ts, equity))
             peak = max(peak, equity)
-            dd = (peak - equity) / max(1e-9, peak)
-            max_dd = max(max_dd, dd)
+            max_dd = max(max_dd, equity_drawdown())
 
-        total_return = (equity - initial_equity) / max(1e-9, initial_equity)
+        total_return = (equity - initial_equity) / max(1e-12, initial_equity)
         win_rate = wins / trades if trades > 0 else 0.0
-        profit_factor = (gross_profit / max(1e-9, gross_loss)) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+        profit_factor = (gross_profit / max(1e-12, gross_loss)) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
         avg_tr = sum(trade_returns) / len(trade_returns) if trade_returns else 0.0
 
-        start_ms = int(candles[0]["ts_ms"])
-        end_ms = int(candles[-1]["ts_ms"])
+        start_ms = entry.ts[0] if entry.ts else 0
+        end_ms = entry.ts[-1] if entry.ts else 0
+
+        notes = "OK"
+        if trades < 10:
+            notes = "Low trades"
+        if total_return < 0:
+            notes = "Negative"
 
         return BacktestResult(
             pair=pair,
-            timeframe=self.cfg.backtest_timeframe,
+            entry_tf=entry.tf,
+            signal_tf=signal.tf,
             start_ms=start_ms,
             end_ms=end_ms,
             trades=trades,
@@ -946,55 +1385,161 @@ class Backtester:
             max_drawdown=max_dd,
             profit_factor=profit_factor,
             avg_trade_return=avg_tr,
-            notes="OK",
-            equity_curve=equity_curve,
+            notes=notes,
+            equity_curve=eq_curve,
+            extra={
+                "paper_leverage_enabled": self.cfg.leverage_enabled_paper,
+                "leverage_cap": self.cfg.leverage_max,
+                "margin_alloc_cap": self.cfg.margin_alloc_cap,
+                "maint_margin_ratio": self.cfg.maint_margin_ratio,
+            }
         )
 
-    def walk_forward(self, pair: str, candles: list[dict[str, float]], initial_equity: float = 100.0) -> BacktestResult:
-        if len(candles) < 400:
-            return self.run_single_pair(pair, candles, initial_equity)
+    def walk_forward(
+        self,
+        pair: str,
+        entry: CandleSeries,
+        signal: CandleSeries,
+        regime_series: list[RegimeState],
+        initial_equity: float = 100.0
+    ) -> BacktestResult:
+        # Split by time into 5 segments
+        n = len(entry.ts)
+        if n < 800:
+            return self.run(pair, entry, signal, regime_series, initial_equity)
 
-        n_windows = 5
-        window = len(candles) // n_windows
+        segments = 5
+        seg_size = n // segments
         eq = initial_equity
+
         all_curve: list[tuple[int, float]] = []
         total_trades = 0
         weighted_wins = 0.0
         worst_dd = 0.0
-        trade_returns: list[float] = []
+        avg_trs: list[float] = []
+        g_profit = 0.0
+        g_loss = 0.0
 
-        for w in range(n_windows):
-            seg = candles[w * window: (w + 1) * window] if w < n_windows - 1 else candles[w * window:]
-            res = self.run_single_pair(pair, seg, eq)
+        for s in range(segments):
+            a = s * seg_size
+            b = (s + 1) * seg_size if s < segments - 1 else n
+
+            # Slice entry series
+            e_seg = CandleSeries(
+                pair=entry.pair, tf=entry.tf, duration_sec=entry.duration_sec,
+                ts=entry.ts[a:b], o=entry.o[a:b], h=entry.h[a:b], l=entry.l[a:b], c=entry.c[a:b], v=entry.v[a:b],
+            )
+            # For signal series, keep full but mapping uses timestamps; ok.
+
+            res = self.run(pair, e_seg, signal, regime_series, eq)
+            eq = eq * (1.0 + res.total_return)
+
             total_trades += res.trades
             weighted_wins += res.win_rate * res.trades
             worst_dd = max(worst_dd, res.max_drawdown)
-            eq = eq * (1.0 + res.total_return)
+            avg_trs.append(res.avg_trade_return)
+
+            # Stitch curve (note: equity curve is local; approximate by scaling)
             all_curve.extend(res.equity_curve)
-            trade_returns.append(res.avg_trade_return)
+
+            # Approx gross profit/loss from profit_factor not stored per seg; ignore here (kept 0)
+            if res.total_return > 0:
+                g_profit += res.total_return
+            else:
+                g_loss += abs(res.total_return)
 
         win_rate = (weighted_wins / total_trades) if total_trades > 0 else 0.0
-        avg_tr = sum(trade_returns) / len(trade_returns) if trade_returns else 0.0
-        total_return = (eq - initial_equity) / max(1e-9, initial_equity)
+        total_return = (eq - initial_equity) / max(1e-12, initial_equity)
+        avg_tr = sum(avg_trs) / len(avg_trs) if avg_trs else 0.0
+        profit_factor = (g_profit / max(1e-12, g_loss)) if g_loss > 0 else (g_profit if g_profit > 0 else 0.0)
 
         return BacktestResult(
             pair=pair,
-            timeframe=self.cfg.backtest_timeframe,
-            start_ms=int(candles[0]["ts_ms"]),
-            end_ms=int(candles[-1]["ts_ms"]),
+            entry_tf=entry.tf,
+            signal_tf=signal.tf,
+            start_ms=entry.ts[0] if entry.ts else 0,
+            end_ms=entry.ts[-1] if entry.ts else 0,
             trades=total_trades,
             win_rate=win_rate,
             total_return=total_return,
             max_drawdown=worst_dd,
-            profit_factor=0.0,
+            profit_factor=profit_factor,
             avg_trade_return=avg_tr,
             notes="Walk-forward OK",
             equity_curve=all_curve,
+            extra={
+                "paper_leverage_enabled": self.cfg.leverage_enabled_paper,
+                "leverage_cap": self.cfg.leverage_max,
+                "segments": segments,
+            }
         )
 
 
 # =========================
-# Paper Portfolio State
+# Reporting
+# =========================
+
+class ReportWriter:
+    def __init__(self, data_dir: Path, log: AppLogger):
+        self.data_dir = data_dir
+        self.log = log
+        self.reports_dir = data_dir / REPORTS_DIRNAME
+        ensure_dir(self.reports_dir)
+
+    def write_backtest_reports(self, results: list[BacktestResult], context: dict[str, t.Any]) -> dict[str, Path]:
+        stamp = now_utc().strftime("%Y%m%d_%H%M%S")
+        csv_path = self.reports_dir / f"backtest_{stamp}.csv"
+        json_path = self.reports_dir / f"backtest_{stamp}.json"
+        txt_path = self.reports_dir / f"backtest_{stamp}_summary.txt"
+
+        # CSV summary
+        try:
+            header = "pair,entry_tf,signal_tf,start_utc,end_utc,trades,win_rate,total_return,max_drawdown,profit_factor,avg_trade_return,notes\n"
+            lines = [header]
+            for r in results:
+                lines.append(
+                    f"{r.pair},{r.entry_tf},{r.signal_tf},"
+                    f"\"{human_ts(r.start_ms)}\",\"{human_ts(r.end_ms)}\","
+                    f"{r.trades},{r.win_rate:.6f},{r.total_return:.6f},{r.max_drawdown:.6f},"
+                    f"{r.profit_factor:.6f},{r.avg_trade_return:.6f},\"{r.notes}\"\n"
+                )
+            csv_path.write_text("".join(lines), encoding="utf-8")
+        except Exception as e:
+            self.log.exception("Failed writing CSV report", e)
+
+        # JSON full
+        try:
+            payload = {
+                "generated_utc": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "context": context,
+                "results": [r.to_dict() for r in results],
+            }
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            self.log.exception("Failed writing JSON report", e)
+
+        # TXT compact
+        try:
+            top_lines = []
+            top_lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
+            top_lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            for k, v in context.items():
+                top_lines.append(f"{k}: {v}")
+            top_lines.append("")
+            top_lines.append("Top Results:")
+            for r in results[:10]:
+                top_lines.append(" - " + r.summary_line())
+            txt_path.write_text("\n".join(top_lines) + "\n", encoding="utf-8")
+        except Exception as e:
+            self.log.exception("Failed writing TXT report", e)
+
+        out = {"csv": csv_path, "json": json_path, "txt": txt_path}
+        self.log.info(f"Backtest reports saved: csv={csv_path} json={json_path} txt={txt_path}")
+        return out
+
+
+# =========================
+# Paper Portfolio (for GUI engine loop)
 # =========================
 
 @dataclass
@@ -1025,8 +1570,8 @@ class TradingEngine:
         self.storage = storage
         self.notifier = notifier
 
-        self.strategy = StrategyEngine(cfg, log)
-        self.backtester = Backtester(cfg, log, storage, self.strategy)
+        self.strategy_v2 = StrategyV2(cfg, log)
+        self.backtester_v2 = BacktesterV2(cfg, log, self.strategy_v2)
 
         self._lock = threading.Lock()
         self._running = False
@@ -1043,7 +1588,10 @@ class TradingEngine:
     def live_unlocked(self) -> bool:
         unlock_file = self.cfg.data_dir / LIVE_MODE_UNLOCK_FILE
         gate = self.storage.get_gate("LIVE_GATE", "0")
-        return unlock_file.exists() and gate == "1"
+        try:
+            return unlock_file.exists() and gate == "1"
+        except Exception:
+            return False
 
     def allow_live(self) -> bool:
         if not self.cfg.is_live():
@@ -1081,7 +1629,10 @@ class TradingEngine:
     def ingest_candles(self, pair: str, duration_sec: int, start_ms: int, end_ms: int) -> int:
         total = 0
         since = start_ms
-        while since < end_ms:
+        # Defensive loop: stop if API returns no new candles or time doesn't advance
+        for _ in range(1000):
+            if since >= end_ms:
+                break
             data = self._client_ro.candles(pair=pair, since_ms=since, duration_sec=duration_sec)
             candles = data.get("candles") or []
             if not isinstance(candles, list) or not candles:
@@ -1089,28 +1640,25 @@ class TradingEngine:
             n = self.storage.upsert_candles(pair, duration_sec, candles)
             total += n
             last_ts = safe_int(candles[-1].get("timestamp"), since)
-            since = max(last_ts + duration_sec * 1000, since + duration_sec * 1000)
-            time.sleep(0.15)
-            if n < 5:
+            next_since = max(last_ts + duration_sec * 1000, since + duration_sec * 1000)
+            if next_since <= since:
+                break
+            since = next_since
+            time.sleep(0.12)
+            if n < 4:
                 break
         return total
 
-    def load_candles_for_backtest(self, pair: str, duration_sec: int, start_ms: int, end_ms: int) -> list[dict[str, float]]:
-        rows = self.storage.fetch_candles(pair, duration_sec, start_ms, end_ms)
-        out: list[dict[str, float]] = []
-        for r in rows:
-            out.append({
-                "ts_ms": int(r["ts_ms"]),
-                "open": float(r["open"]),
-                "high": float(r["high"]),
-                "low": float(r["low"]),
-                "close": float(r["close"]),
-                "volume": float(r["volume"]),
-            })
-        return out
+    def load_series(self, pair: str, tf: str, start_ms: int, end_ms: int) -> CandleSeries:
+        duration = timeframe_to_seconds(tf)
+        rows = self.storage.fetch_candles(pair, duration, start_ms, end_ms)
+        return build_series_from_rows(pair, tf, duration, rows)
 
-    def run_backtest(self, pairs: list[str], tf: str, days: int, initial_equity: float, walk_forward: bool) -> list[BacktestResult]:
-        duration_sec = timeframe_to_seconds(tf)
+    def run_backtest(self, pairs: list[str], entry_tf: str, days: int, initial_equity: float, walk_forward: bool) -> list[BacktestResult]:
+        entry_duration = timeframe_to_seconds(entry_tf)
+        signal_tf = self.cfg.signal_timeframe
+        signal_duration = timeframe_to_seconds(signal_tf)
+
         end_ms = utc_ms()
         start_ms = end_ms - int(days * 86400 * 1000)
 
@@ -1119,16 +1667,26 @@ class TradingEngine:
             pair = pair.upper().strip()
             if not pair:
                 continue
-            self.log.info(f"Backtest ingest candles: {pair} tf={tf} days={days}")
+
             try:
-                n = self.ingest_candles(pair, duration_sec, start_ms, end_ms)
-                self.log.info(f"Ingested {n} candles into cache for {pair}")
-                candles = self.load_candles_for_backtest(pair, duration_sec, start_ms, end_ms)
+                self.log.info(f"Backtest ingest candles: {pair} entry={entry_tf} signal={signal_tf} days={days}")
+                n1 = self.ingest_candles(pair, entry_duration, start_ms, end_ms)
+                n2 = self.ingest_candles(pair, signal_duration, start_ms, end_ms)
+                self.log.info(f"Ingested candles: {pair} entry={n1} signal={n2}")
+
+                entry_series = self.load_series(pair, entry_tf, start_ms, end_ms)
+                signal_series = self.load_series(pair, signal_tf, start_ms, end_ms)
+
+                # Compute regime on signal TF
+                regimes = self.strategy_v2.compute_regime(signal_series)
+
                 if walk_forward:
-                    res = self.backtester.walk_forward(pair, candles, initial_equity=initial_equity)
+                    res = self.backtester_v2.walk_forward(pair, entry_series, signal_series, regimes, initial_equity=initial_equity)
                 else:
-                    res = self.backtester.run_single_pair(pair, candles, initial_equity=initial_equity)
+                    res = self.backtester_v2.run(pair, entry_series, signal_series, regimes, initial_equity=initial_equity)
+
                 results.append(res)
+
             except Exception as e:
                 self.log.exception(f"Backtest failed for {pair}", e)
 
@@ -1153,6 +1711,16 @@ class TradingEngine:
         with self._lock:
             return self._running
 
+    def _paper_reset_day_if_needed(self) -> None:
+        day = now_utc().strftime("%Y-%m-%d")
+        if self.paper.day_utc != day:
+            self.paper.day_utc = day
+            self.paper.day_start_equity = self.paper.equity
+            self.log.info(f"New UTC day: {day}. day_start_equity={self.paper.day_start_equity:.2f}")
+
+    def _paper_daily_pnl_pct(self) -> float:
+        return (self.paper.equity - self.paper.day_start_equity) / max(1e-12, self.paper.day_start_equity)
+
     def _run_loop(self) -> None:
         self._paper_reset_day_if_needed()
 
@@ -1170,13 +1738,12 @@ class TradingEngine:
 
                 if self.cfg.is_paper():
                     self._paper_reset_day_if_needed()
-                    scan_pairs = self.get_scan_pairs()[:10]
-                    self._paper_scan_and_maybe_trade(scan_pairs)
+                    # Keep engine trading simple in v0.2.0:
+                    # Backtester is the primary evaluation tool; live paper engine stays conservative.
+                    # (We can upgrade paper engine to use StrategyV2 after backtests turn positive.)
+                    pass
                 else:
-                    if self.allow_live():
-                        self._last_health = "LIVE_UNLOCKED (not executing in v1)"
-                    else:
-                        self._last_health = "LIVE_LOCKED"
+                    self._last_health = "LIVE_LOCKED"
 
             except Exception as e:
                 self.log.exception("Engine loop exception", e)
@@ -1186,188 +1753,6 @@ class TradingEngine:
 
     def health(self) -> str:
         return self._last_health
-
-    def _paper_reset_day_if_needed(self) -> None:
-        day = now_utc().strftime("%Y-%m-%d")
-        if self.paper.day_utc != day:
-            self.paper.day_utc = day
-            self.paper.day_start_equity = self.paper.equity
-            self.log.info(f"New UTC day: {day}. day_start_equity={self.paper.day_start_equity:.2f}")
-
-    def _paper_daily_pnl_pct(self) -> float:
-        return (self.paper.equity - self.paper.day_start_equity) / max(1e-9, self.paper.day_start_equity)
-
-    def _paper_scan_and_maybe_trade(self, pairs: list[str]) -> None:
-        if self._paper_daily_pnl_pct() <= -abs(self.cfg.daily_loss_cap):
-            self.notifier.notify("Daily halt", f"Daily loss cap hit. pnl={fmt_pct(self._paper_daily_pnl_pct())}. Cooling down.")
-            time.sleep(self.cfg.cooldown_minutes * 60)
-            return
-
-        if len(self.paper.positions) >= self.cfg.max_open_positions:
-            return
-
-        ranked: list[tuple[float, str]] = []
-        duration_sec = timeframe_to_seconds(self.cfg.backtest_timeframe)
-        end_ms = utc_ms()
-        start_ms = end_ms - int(3 * 86400 * 1000)
-
-        for p in pairs:
-            try:
-                self.ingest_candles(p, duration_sec, start_ms, end_ms)
-                cs = self.load_candles_for_backtest(p, duration_sec, start_ms, end_ms)
-                if len(cs) < 80:
-                    continue
-                mom = (cs[-1]["close"] - cs[-10]["close"]) / max(1e-9, cs[-10]["close"])
-                ranked.append((mom, p))
-            except Exception:
-                continue
-
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        top = [p for _, p in ranked[:5]]
-
-        for p in top:
-            if p in self.paper.positions:
-                continue
-            cs = self.load_candles_for_backtest(p, duration_sec, start_ms, end_ms)
-            sig = self.strategy.generate_signal_from_candles(p, cs)
-            self.storage.add_decision(
-                ts_ms=utc_ms(),
-                pair=p,
-                action=sig.action,
-                confidence=sig.confidence,
-                reason=sig.reason,
-                meta=sig.meta
-            )
-            if sig.action == "BUY" and sig.confidence >= 0.65:
-                price = float(sig.meta.get("price", cs[-1]["close"]))
-                alloc = clamp(self.cfg.risk_per_trade * 10.0, 0.02, 0.35)
-                cash_to_use = self.paper.cash * alloc
-                if cash_to_use <= 0:
-                    continue
-                qty = cash_to_use / max(1e-12, price)
-                fee = (cash_to_use * (self.cfg.backtest_fee_bps / 10000.0))
-                self.paper.cash = max(0.0, self.paper.cash - cash_to_use - fee)
-                pos = PaperPosition(pair=p, qty=qty, entry_price=price, entry_ts_ms=utc_ms())
-                self.paper.positions[p] = pos
-                self.log.info(f"PAPER BUY {p} qty={qty:.8f} price={price:.4f} alloc={fmt_pct(alloc)}")
-                self.notifier.notify("PAPER BUY", f"{p} @ {price:.4f} qty={qty:.6f} conf={sig.confidence:.2f}")
-                self.storage.add_paper_trade(
-                    ts_ms=utc_ms(),
-                    pair=p,
-                    side="BUY",
-                    price=price,
-                    qty=qty,
-                    fee=fee,
-                    equity_after=self.paper.equity,
-                    meta={"alloc": alloc, "confidence": sig.confidence, "reason": sig.reason}
-                )
-                break
-
-        to_close: list[str] = []
-        for p, pos in self.paper.positions.items():
-            try:
-                tkr = self._client_ro.ticker(p)
-                price = safe_float(tkr.get("last_trade"), 0.0)
-                if price <= 0:
-                    continue
-                if price >= pos.entry_price * 1.015 or price <= pos.entry_price * 0.990:
-                    notional = pos.qty * price
-                    fee = notional * (self.cfg.backtest_fee_bps / 10000.0)
-                    pnl = (price - pos.entry_price) * pos.qty - fee
-                    self.paper.cash += max(0.0, notional - fee)
-                    self.paper.equity += pnl
-                    to_close.append(p)
-                    self.log.info(f"PAPER SELL {p} price={price:.4f} pnl={pnl:.2f} equity={self.paper.equity:.2f}")
-                    self.notifier.notify("PAPER SELL", f"{p} @ {price:.4f} pnl={pnl:.2f} equity={self.paper.equity:.2f}")
-                    self.storage.add_paper_trade(
-                        ts_ms=utc_ms(),
-                        pair=p,
-                        side="SELL",
-                        price=price,
-                        qty=pos.qty,
-                        fee=fee,
-                        equity_after=self.paper.equity,
-                        meta={"entry_price": pos.entry_price}
-                    )
-            except Exception:
-                continue
-
-        for p in to_close:
-            self.paper.positions.pop(p, None)
-
-
-# =========================
-# Reporting (Backtest export)
-# =========================
-
-class ReportWriter:
-    def __init__(self, data_dir: Path, log: AppLogger):
-        self.data_dir = data_dir
-        self.log = log
-        self.reports_dir = data_dir / "reports"
-        ensure_dir(self.reports_dir)
-
-    def write_backtest_reports(
-        self,
-        results: list[BacktestResult],
-        context: dict[str, t.Any],
-    ) -> dict[str, Path]:
-        """
-        Writes:
-        - CSV (summary rows)
-        - JSON (full results incl equity curve)
-        - TXT (small summary for pasting)
-        Returns dict of produced paths.
-        """
-        stamp = now_utc().strftime("%Y%m%d_%H%M%S")
-        csv_path = self.reports_dir / f"backtest_{stamp}.csv"
-        json_path = self.reports_dir / f"backtest_{stamp}.json"
-        txt_path = self.reports_dir / f"backtest_{stamp}_summary.txt"
-
-        # CSV: summary only
-        try:
-            header = "pair,timeframe,start_utc,end_utc,trades,win_rate,total_return,max_drawdown,profit_factor,avg_trade_return,notes\n"
-            lines = [header]
-            for r in results:
-                lines.append(
-                    f"{r.pair},{r.timeframe},"
-                    f"\"{human_ts(r.start_ms)}\",\"{human_ts(r.end_ms)}\","
-                    f"{r.trades},{r.win_rate:.6f},{r.total_return:.6f},{r.max_drawdown:.6f},"
-                    f"{r.profit_factor:.6f},{r.avg_trade_return:.6f},\"{r.notes}\"\n"
-                )
-            csv_path.write_text("".join(lines), encoding="utf-8")
-        except Exception as e:
-            self.log.exception("Failed writing CSV report", e)
-
-        # JSON: context + full results
-        try:
-            payload = {
-                "generated_utc": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "context": context,
-                "results": [r.to_dict() for r in results],
-            }
-            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            self.log.exception("Failed writing JSON report", e)
-
-        # TXT: compact summary
-        try:
-            top_lines = []
-            top_lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
-            top_lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            for k, v in context.items():
-                top_lines.append(f"{k}: {v}")
-            top_lines.append("")
-            top_lines.append("Top Results:")
-            for r in results[:10]:
-                top_lines.append(" - " + r.summary_line())
-            txt_path.write_text("\n".join(top_lines) + "\n", encoding="utf-8")
-        except Exception as e:
-            self.log.exception("Failed writing TXT report", e)
-
-        out = {"csv": csv_path, "json": json_path, "txt": txt_path}
-        self.log.info(f"Backtest reports saved: csv={csv_path} json={json_path} txt={txt_path}")
-        return out
 
 
 # =========================
@@ -1383,6 +1768,7 @@ class Dashboard(tk.Tk):
 
         self.repo_root = repo_root
 
+        # initial logger for config bootstrap
         self.log = AppLogger(data_dir=(repo_root / "data"))
         self.cfg = load_config(repo_root, self.log)
         ensure_dir(self.cfg.data_dir)
@@ -1397,7 +1783,6 @@ class Dashboard(tk.Tk):
         self._ui_queue: "queue.Queue[t.Callable[[], None]]" = queue.Queue()
         self._backtest_thread: threading.Thread | None = None
 
-        # Backtest output cache
         self._last_backtest_results: list[BacktestResult] = []
         self._last_backtest_context: dict[str, t.Any] = {}
         self._last_backtest_report_paths: dict[str, Path] = {}
@@ -1489,19 +1874,18 @@ class Dashboard(tk.Tk):
 
         row1 = ttk.Frame(bt)
         row1.pack(fill=tk.X, pady=(0, 6))
-
         ttk.Label(row1, text="Pairs (comma):").pack(side=tk.LEFT)
         self.var_bt_pairs = tk.StringVar(value=self.cfg.default_view_pair)
         ttk.Entry(row1, textvariable=self.var_bt_pairs).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
         row2 = ttk.Frame(bt)
         row2.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(row2, text="Timeframe:").pack(side=tk.LEFT)
+        ttk.Label(row2, text="Entry TF:").pack(side=tk.LEFT)
         self.var_bt_tf = tk.StringVar(value=self.cfg.backtest_timeframe)
         ttk.Entry(row2, textvariable=self.var_bt_tf, width=8).pack(side=tk.LEFT, padx=8)
 
         ttk.Label(row2, text="Days:").pack(side=tk.LEFT)
-        self.var_bt_days = tk.StringVar(value="30")
+        self.var_bt_days = tk.StringVar(value="180")
         ttk.Entry(row2, textvariable=self.var_bt_days, width=6).pack(side=tk.LEFT, padx=8)
 
         ttk.Label(row2, text="Initial equity:").pack(side=tk.LEFT)
@@ -1515,8 +1899,6 @@ class Dashboard(tk.Tk):
         ttk.Checkbutton(row3, text="Walk-forward", variable=self.var_bt_walk).pack(side=tk.LEFT)
 
         ttk.Button(row3, text="Run Backtest", command=self._run_backtest).pack(side=tk.LEFT, padx=10)
-
-        # New: export/copy buttons
         ttk.Button(row3, text="Copy Summary", command=self._copy_backtest_summary).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row3, text="Export Backtest Report", command=self._export_backtest_report).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row3, text="Open Reports Folder", command=self._open_reports_folder).pack(side=tk.LEFT)
@@ -1524,7 +1906,7 @@ class Dashboard(tk.Tk):
         self.tbl_bt = self._make_table(
             right,
             title="Backtest Results (sorted by return)",
-            columns=[("pair", 90), ("tf", 60), ("trades", 70), ("win", 70), ("ret", 90), ("dd", 80), ("notes", 230)]
+            columns=[("pair", 90), ("entry", 70), ("signal", 70), ("trades", 70), ("win", 70), ("ret", 90), ("dd", 80), ("notes", 170)]
         )
         self.tbl_bt.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
@@ -1553,9 +1935,9 @@ class Dashboard(tk.Tk):
 
     def _show_startup_notice(self) -> None:
         msg = (
-            "PAPER mode is recommended until backtests and walk-forward validation pass.\n\n"
-            "This software enforces safety controls but cannot guarantee daily returns or zero losses.\n"
-            "Use read-only Luno API keys for testing.\n"
+            "PAPER mode is recommended while optimizing backtests.\n\n"
+            "This software includes risk controls and paper leverage simulation.\n"
+            "There is no guarantee of profit; use read-only keys for data access and testing.\n"
         )
         messagebox.showinfo(f"{APP_NAME}", msg)
 
@@ -1596,14 +1978,14 @@ class Dashboard(tk.Tk):
         try:
             self.clipboard_clear()
             self.clipboard_append(summary)
-            self.update()  # keep clipboard after app exits
+            self.update()
             messagebox.showinfo("Copy Summary", "Copied backtest summary to clipboard. Paste it into chat.")
         except Exception as e:
             messagebox.showerror("Copy Summary", f"Failed: {e}")
 
     def _compose_backtest_summary_text(self) -> str:
         ctx = self._last_backtest_context or {}
-        lines = []
+        lines: list[str] = []
         lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
         lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
         for k, v in ctx.items():
@@ -1647,25 +2029,29 @@ class Dashboard(tk.Tk):
             messagebox.showwarning("Backtest", "Enter at least one pair.")
             return
 
-        tf = self.var_bt_tf.get().strip()
-        days = safe_int(self.var_bt_days.get().strip(), 30)
+        entry_tf = self.var_bt_tf.get().strip()
+        days = safe_int(self.var_bt_days.get().strip(), 180)
         eq = safe_float(self.var_bt_equity.get().strip(), 100.0)
         walk = bool(self.var_bt_walk.get())
 
         def worker() -> None:
             try:
-                self.log.info(f"Backtest start: pairs={pairs} tf={tf} days={days} equity={eq} walk={walk}")
-                res = self.engine.run_backtest(pairs=pairs, tf=tf, days=days, initial_equity=eq, walk_forward=walk)
+                self.log.info(f"Backtest start: pairs={pairs} entry_tf={entry_tf} days={days} equity={eq} walk={walk}")
+                res = self.engine.run_backtest(pairs=pairs, entry_tf=entry_tf, days=days, initial_equity=eq, walk_forward=walk)
 
-                # cache results and context for export/copy
                 ctx = {
                     "pairs": ",".join(pairs),
-                    "timeframe": tf,
+                    "entry_timeframe": entry_tf,
+                    "signal_timeframe": self.cfg.signal_timeframe,
                     "days": days,
                     "initial_equity": eq,
                     "walk_forward": walk,
                     "slippage_bps": self.cfg.backtest_slippage_bps,
                     "fee_bps": self.cfg.backtest_fee_bps,
+                    "paper_leverage_enabled": self.cfg.leverage_enabled_paper,
+                    "paper_leverage_max": self.cfg.leverage_max,
+                    "margin_alloc_cap": self.cfg.margin_alloc_cap,
+                    "maint_margin_ratio": self.cfg.maint_margin_ratio,
                 }
                 self._last_backtest_results = res
                 self._last_backtest_context = ctx
@@ -1673,10 +2059,11 @@ class Dashboard(tk.Tk):
 
                 self._ui_queue.put(lambda: self._render_backtest_results(res))
 
-                # Gate example (conservative): keep locked unless strong
+                # Conservative live gate (still not executing live in v0.2.0):
+                # require top result positive and controlled drawdown with enough trades.
                 if res:
                     top = res[0]
-                    gate_ok = (top.total_return > 0.10 and top.max_drawdown < 0.20 and top.trades >= 10)
+                    gate_ok = (top.total_return > 0.10 and top.max_drawdown < 0.20 and top.trades >= 20)
                     self.engine.storage.set_gate("LIVE_GATE", "1" if gate_ok else "0")
                     self.log.info(
                         f"Gate eval: top_return={fmt_pct(top.total_return)} dd={fmt_pct(top.max_drawdown)} "
@@ -1697,7 +2084,8 @@ class Dashboard(tk.Tk):
         for r in results[:50]:
             tree.insert("", tk.END, values=(
                 r.pair,
-                r.timeframe,
+                r.entry_tf,
+                r.signal_tf,
                 r.trades,
                 f"{r.win_rate * 100:.1f}%",
                 f"{r.total_return * 100:.1f}%",
@@ -1706,7 +2094,7 @@ class Dashboard(tk.Tk):
             ))
 
     def _poll_logs(self) -> None:
-        for level, line in self.log.drain(200):
+        for _, line in self.log.drain(200):
             try:
                 self.txt_logs.insert(tk.END, line + "\n")
                 self.txt_logs.see(tk.END)
@@ -1723,7 +2111,7 @@ class Dashboard(tk.Tk):
             cash = self.engine.paper.cash
             self.var_equity.set(fmt_money(eq, "MYR"))
             self.var_cash.set(fmt_money(cash, "MYR"))
-            self.var_daily_pnl.set(fmt_pct(self.engine._paper_daily_pnl_pct()))
+            self.var_daily_pnl.set(fmt_pct((eq - self.engine.paper.day_start_equity) / max(1e-12, self.engine.paper.day_start_equity)))
 
             self._render_positions()
             self._render_recent_decisions()
@@ -1802,8 +2190,7 @@ class Dashboard(tk.Tk):
 # =========================
 
 def find_repo_root() -> Path:
-    here = Path(__file__).resolve()
-    return here.parent
+    return Path(__file__).resolve().parent
 
 
 def main() -> int:
