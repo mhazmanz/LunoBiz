@@ -1,18 +1,22 @@
 """
-LunoBiz - Single-file Windows application (v0.2.0)
+LunoBiz - Single-file Windows application (v0.3.0)
 
 Key features:
 - GUI dashboard (values & tables only)
 - Robust candle caching in SQLite
 - Backtesting with walk-forward validation
-- Paper trading engine
+- Paper trading engine scaffold (paper-only)
 - Paper-only leverage simulation (no live execution)
-- R-based risk sizing, partial exits, trailing stops, liquidation simulation
+- Mean-reversion / volatility-expansion strategy (v0.3.0)
 - Safety controls: kill switch, live gate (still locked by default)
 
 Public-repo safe:
 - No secrets in code
 - Reads secrets from .env (git-ignored) or environment variables
+
+Notes:
+- This software is for research/testing. Markets are risky.
+- Paper leverage simulation is only a simulation; live execution remains locked.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import threading
 import time
 import traceback
 import typing as t
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,7 +57,7 @@ except Exception as e:
 # =========================
 
 APP_NAME = "LunoBiz"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 DEFAULT_API_BASE = "https://api.luno.com"
 
 # Luno endpoints
@@ -167,6 +172,13 @@ def open_folder_in_explorer(folder: Path) -> None:
         pass
 
 
+def safe_json_loads(s: str, default: t.Any) -> t.Any:
+    try:
+        return json.loads(s)
+    except Exception:
+        return default
+
+
 # =========================
 # .env loader (no extra deps)
 # =========================
@@ -246,6 +258,7 @@ class AppLogger:
         line = f"[{ts} UTC] {level.upper():<5} {msg}"
         self._q.put((level.upper(), line))
         try:
+            ensure_dir(self._data_dir)
             with self._log_file.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
@@ -301,7 +314,7 @@ class AppConfig:
 
     # Backtest parameters
     backtest_timeframe: str         # entry timeframe
-    signal_timeframe: str           # higher timeframe for regime
+    signal_timeframe: str           # higher timeframe for regime / volatility checks
     backtest_slippage_bps: float
     backtest_fee_bps: float
 
@@ -311,6 +324,21 @@ class AppConfig:
     leverage_min: float             # typically 1
     margin_alloc_cap: float         # cap margin usage fraction of equity per position
     maint_margin_ratio: float       # simplistic maintenance margin ratio
+
+    # Strategy v0.3 (mean reversion / vol expansion)
+    mr_window: int                  # rolling window for z-score / bands
+    mr_z_enter: float               # enter when z <= -mr_z_enter (long-only)
+    mr_z_exit: float                # exit when z >= -mr_z_exit (closer to mean, mr_z_exit < mr_z_enter)
+    mr_bb_k: float                  # bollinger k
+    mr_atr_period: int              # ATR period on entry TF
+    mr_atr_stop_mult: float         # stop = entry - atr*mult
+    mr_tp_mode: str                 # "VWAP" or "MID" (bollinger mid)
+    mr_tp_min_r: float              # minimum expected reward in R before allowing trade
+    mr_max_hold_bars: int           # time stop
+    mr_min_atr_pct: float           # avoid dead chop
+    mr_max_atr_pct: float           # avoid extreme spikes
+    mr_vol_expand_ratio: float      # ATR now / ATR slow must be >= this
+    mr_cooldown_after_loss_bars: int  # cooldown bars after a losing exit
 
     data_dir: Path
     db_filename: str
@@ -365,10 +393,25 @@ def load_config(repo_root: Path, log: AppLogger) -> AppConfig:
         backtest_fee_bps=safe_float(envs("BACKTEST_FEE_BPS", "30"), 30.0),
 
         leverage_enabled_paper=(envs("PAPER_LEVERAGE_ENABLED", "1").strip() not in ("0", "false", "False")),
-        leverage_max=clamp(safe_float(envs("PAPER_LEVERAGE_MAX", "3.0"), 3.0), 1.0, 10.0),
+        leverage_max=clamp(safe_float(envs("PAPER_LEVERAGE_MAX", "2.0"), 2.0), 1.0, 10.0),
         leverage_min=clamp(safe_float(envs("PAPER_LEVERAGE_MIN", "1.0"), 1.0), 1.0, 10.0),
         margin_alloc_cap=clamp(safe_float(envs("MARGIN_ALLOC_CAP", "0.60"), 0.60), 0.05, 0.95),
         maint_margin_ratio=clamp(safe_float(envs("MAINT_MARGIN_RATIO", "0.35"), 0.35), 0.05, 0.95),
+
+        # Strategy v0.3 defaults (safe starter values)
+        mr_window=max(20, safe_int(envs("MR_WINDOW", "80"), 80)),
+        mr_z_enter=clamp(safe_float(envs("MR_Z_ENTER", "2.0"), 2.0), 0.8, 6.0),
+        mr_z_exit=clamp(safe_float(envs("MR_Z_EXIT", "0.6"), 0.6), 0.1, 3.0),
+        mr_bb_k=clamp(safe_float(envs("MR_BB_K", "2.0"), 2.0), 0.8, 4.0),
+        mr_atr_period=max(5, safe_int(envs("MR_ATR_PERIOD", "14"), 14)),
+        mr_atr_stop_mult=clamp(safe_float(envs("MR_ATR_STOP_MULT", "1.4"), 1.4), 0.6, 5.0),
+        mr_tp_mode=(envs("MR_TP_MODE", "VWAP").strip().upper() or "VWAP"),
+        mr_tp_min_r=clamp(safe_float(envs("MR_TP_MIN_R", "0.9"), 0.9), 0.1, 5.0),
+        mr_max_hold_bars=max(6, safe_int(envs("MR_MAX_HOLD_BARS", "24"), 24)),
+        mr_min_atr_pct=clamp(safe_float(envs("MR_MIN_ATR_PCT", "0.0010"), 0.0010), 0.0, 0.02),
+        mr_max_atr_pct=clamp(safe_float(envs("MR_MAX_ATR_PCT", "0.0600"), 0.0600), 0.01, 0.50),
+        mr_vol_expand_ratio=clamp(safe_float(envs("MR_VOL_EXPAND_RATIO", "1.15"), 1.15), 0.8, 3.0),
+        mr_cooldown_after_loss_bars=max(0, safe_int(envs("MR_COOLDOWN_AFTER_LOSS_BARS", "6"), 6)),
 
         data_dir=data_dir,
         db_filename=envs("DB_FILENAME", "lunobiz.sqlite3"),
@@ -381,8 +424,9 @@ def load_config(repo_root: Path, log: AppLogger) -> AppConfig:
     ensure_dir(cfg.data_dir)
     log.info(
         f"Config loaded. mode={cfg.app_mode.upper()} data_dir={cfg.data_dir} "
-        f"bt_tf={cfg.backtest_timeframe} signal_tf={cfg.signal_timeframe} "
-        f"paper_leverage={'ON' if cfg.leverage_enabled_paper else 'OFF'}"
+        f"bt_tf={cfg.backtest_timeframe} signal_tf={cfg.signal_timeframe} fee_bps={cfg.backtest_fee_bps} "
+        f"mr_window={cfg.mr_window} z_enter={cfg.mr_z_enter} z_exit={cfg.mr_z_exit} "
+        f"paper_leverage={'ON' if cfg.leverage_enabled_paper else 'OFF'} lev_cap={cfg.leverage_max}"
     )
     return cfg
 
@@ -594,7 +638,13 @@ class LunoClient:
         token = base64.b64encode(f"{key}:{sec}".encode("utf-8")).decode("ascii")
         return {"Authorization": f"Basic {token}"}
 
-    def _request(self, method: str, path: str, params: dict[str, t.Any] | None = None, data: dict[str, t.Any] | None = None) -> dict[str, t.Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, t.Any] | None = None,
+        data: dict[str, t.Any] | None = None
+    ) -> dict[str, t.Any]:
         url = f"{self.base}{path}"
         headers = {"Accept": "application/json"}
         headers.update(self._auth_header())
@@ -658,7 +708,7 @@ class LunoClient:
 
 
 # =========================
-# Indicators
+# Indicators (lightweight, list-based)
 # =========================
 
 def ema(values: list[float], period: int) -> list[float]:
@@ -685,7 +735,7 @@ def rsi(values: list[float], period: int = 14) -> list[float]:
         losses.append(max(0.0, -ch))
     avg_gain = sum(gains[1:period + 1]) / period
     avg_loss = sum(losses[1:period + 1]) / period
-    out: list[float] = [50.0] * (period)
+    out: list[float] = [50.0] * period
     rs = avg_gain / (avg_loss + 1e-12)
     out.append(100.0 - (100.0 / (1.0 + rs)))
     for i in range(period + 1, len(values)):
@@ -708,56 +758,74 @@ def atr(high: list[float], low: list[float], close: list[float], period: int = 1
     return ema(tr, period)
 
 
-def adx(high: list[float], low: list[float], close: list[float], period: int = 14) -> list[float]:
+def rolling_mean_std(values: list[float], window: int) -> tuple[list[float], list[float]]:
     """
-    Wilder's ADX implementation (sufficient for regime filtering).
-    Returns list aligned to inputs length, using 0 until enough data accumulates.
+    Rolling mean/std with O(n) using running sums.
+    std is population std over window.
+    For indices < window-1, returns 0 mean/std to keep alignment.
+    """
+    n = len(values)
+    if n == 0:
+        return [], []
+    w = max(2, int(window))
+    means = [0.0] * n
+    stds = [0.0] * n
+
+    s = 0.0
+    ss = 0.0
+    for i, x in enumerate(values):
+        s += x
+        ss += x * x
+        if i >= w:
+            x0 = values[i - w]
+            s -= x0
+            ss -= x0 * x0
+        if i >= w - 1:
+            mu = s / w
+            var = max(0.0, (ss / w) - (mu * mu))
+            means[i] = mu
+            stds[i] = math.sqrt(var)
+    return means, stds
+
+
+def rolling_vwap(close: list[float], volume: list[float], window: int) -> list[float]:
+    """
+    Rolling VWAP using close as typical price proxy.
+    vwap = sum(price*vol)/sum(vol)
     """
     n = len(close)
-    if n < period * 3:
-        return [0.0] * n
+    if n == 0:
+        return []
+    w = max(2, int(window))
+    out = [0.0] * n
+    pv = 0.0
+    vv = 0.0
+    for i in range(n):
+        p = close[i]
+        v = max(0.0, volume[i] if i < len(volume) else 0.0)
+        pv += p * v
+        vv += v
+        if i >= w:
+            p0 = close[i - w]
+            v0 = max(0.0, volume[i - w] if (i - w) < len(volume) else 0.0)
+            pv -= p0 * v0
+            vv -= v0
+        if i >= w - 1:
+            out[i] = (pv / vv) if vv > 1e-12 else close[i]
+    return out
 
-    plus_dm = [0.0] * n
-    minus_dm = [0.0] * n
-    tr = [0.0] * n
 
-    for i in range(1, n):
-        up = high[i] - high[i - 1]
-        dn = low[i - 1] - low[i]
-        plus_dm[i] = up if (up > dn and up > 0) else 0.0
-        minus_dm[i] = dn if (dn > up and dn > 0) else 0.0
-        tr[i] = max(high[i] - low[i], abs(high[i] - close[i - 1]), abs(low[i] - close[i - 1]))
-
-    def wilder_smooth(series: list[float], p: int) -> list[float]:
-        out = [0.0] * n
-        s = sum(series[1:p + 1])
-        out[p] = s
-        for i in range(p + 1, n):
-            out[i] = out[i - 1] - (out[i - 1] / p) + series[i]
-        return out
-
-    atr_s = wilder_smooth(tr, period)
-    pdm_s = wilder_smooth(plus_dm, period)
-    mdm_s = wilder_smooth(minus_dm, period)
-
-    pdi = [0.0] * n
-    mdi = [0.0] * n
-    dx = [0.0] * n
-    for i in range(period, n):
-        denom = atr_s[i] if atr_s[i] != 0 else 1e-12
-        pdi[i] = 100.0 * (pdm_s[i] / denom)
-        mdi[i] = 100.0 * (mdm_s[i] / denom)
-        d = pdi[i] + mdi[i]
-        dx[i] = 100.0 * (abs(pdi[i] - mdi[i]) / (d if d != 0 else 1e-12))
-
-    # ADX is Wilder's smoothing of DX
-    adx_out = [0.0] * n
-    start = period * 2
-    adx_out[start] = sum(dx[period + 1:start + 1]) / period
-    for i in range(start + 1, n):
-        adx_out[i] = ((adx_out[i - 1] * (period - 1)) + dx[i]) / period
-
-    return adx_out
+def bollinger(close: list[float], window: int, k: float) -> tuple[list[float], list[float], list[float]]:
+    mu, sd = rolling_mean_std(close, window)
+    n = len(close)
+    mid = mu
+    up = [0.0] * n
+    lo = [0.0] * n
+    kk = float(k)
+    for i in range(n):
+        up[i] = mid[i] + kk * sd[i]
+        lo[i] = mid[i] - kk * sd[i]
+    return lo, mid, up
 
 
 # =========================
@@ -811,110 +879,99 @@ def find_last_index_leq(ts_list: list[int], t_ms: int) -> int:
 
 
 # =========================
-# Strategy v0.2 (MTF regime + pullback entry)
+# Strategy v0.3 (Volatility Expansion + Mean Reversion)
 # =========================
 
 @dataclass
-class RegimeState:
-    direction: int   # +1 uptrend, -1 downtrend, 0 neutral
-    strength: float  # 0..1
-    adx: float
+class VolState:
+    """
+    Computed on signal timeframe (higher TF) to avoid trading in dead regimes.
+    """
     atr_pct: float
+    expand_ratio: float   # ATR_fast / ATR_slow
+    ok: bool
+    score: float          # 0..1
 
 
 @dataclass
 class EntrySignal:
-    action: str      # BUY/HOLD
+    action: str           # BUY/HOLD
     confidence: float
     reason: str
     leverage: float
     stop_price: float
+    take_profit: float
     r_value: float
+    max_hold_bars: int
     meta: dict[str, t.Any]
 
 
-class StrategyV2:
+class StrategyV3:
     """
-    MT regime on signal TF (default 1h):
-    - EMA50/EMA200 + slope confirmation
-    - ADX threshold for trending regime
-    - ATR% band to avoid dead chop or extreme spikes
+    Mean Reversion (long-only) with volatility expansion gate.
 
-    Entry TF (default 15m):
-    - Pullback into EMA50 with trend still intact
-    - RSI guard to avoid overextension
+    High-level:
+    - Use signal timeframe (e.g., 1h) to compute if volatility is "alive"
+      via ATR expansion ratio + ATR% band.
+    - Use entry timeframe (e.g., 15m) to detect overextension:
+        * Z-score vs rolling VWAP (or rolling mean)
+        * Bollinger Band touch/penetration
+        * Short RSI exhaustion filter
+    - Exit quickly at mean target (VWAP or mid-band), with strict ATR stop and time stop.
+
+    This is deliberately conservative and fee-aware.
     """
     def __init__(self, cfg: AppConfig, log: AppLogger):
         self.cfg = cfg
         self.log = log
 
-    def compute_regime(self, sig: CandleSeries) -> list[RegimeState]:
-        if len(sig.c) < 250:
-            return [RegimeState(direction=0, strength=0.0, adx=0.0, atr_pct=0.0) for _ in sig.c]
+    def compute_vol_state(self, sig: CandleSeries) -> list[VolState]:
+        n = len(sig.c)
+        if n < max(60, self.cfg.mr_atr_period * 6):
+            return [VolState(atr_pct=0.0, expand_ratio=0.0, ok=False, score=0.0) for _ in range(n)]
 
-        ema50 = ema(sig.c, 50)
-        ema200 = ema(sig.c, 200)
-        a = atr(sig.h, sig.l, sig.c, 14)
-        adxv = adx(sig.h, sig.l, sig.c, 14)
+        atr_fast = atr(sig.h, sig.l, sig.c, self.cfg.mr_atr_period)
+        atr_slow = atr(sig.h, sig.l, sig.c, max(self.cfg.mr_atr_period * 4, 40))
 
-        out: list[RegimeState] = []
-        for i in range(len(sig.c)):
-            price = sig.c[i]
-            if i < 210:
-                out.append(RegimeState(direction=0, strength=0.0, adx=0.0, atr_pct=0.0))
-                continue
+        out: list[VolState] = []
+        for i in range(n):
+            px = sig.c[i]
+            af = atr_fast[i] if i < len(atr_fast) else 0.0
+            aslow = atr_slow[i] if i < len(atr_slow) else 0.0
+            atr_pct = (af / px) if px > 1e-12 else 0.0
+            ratio = (af / aslow) if aslow > 1e-12 else 0.0
 
-            trend = 0
-            if ema50[i] > ema200[i] * 1.001:
-                trend = +1
-            elif ema50[i] < ema200[i] * 0.999:
-                trend = -1
+            band_ok = (atr_pct >= self.cfg.mr_min_atr_pct) and (atr_pct <= self.cfg.mr_max_atr_pct)
+            expand_ok = ratio >= self.cfg.mr_vol_expand_ratio
 
-            # Slope proxy: compare EMA50 now vs 20 bars ago
-            slope = (ema50[i] - ema50[i - 20]) / max(1e-12, ema50[i - 20])
-            slope_strength = clamp(abs(slope) * 200.0, 0.0, 1.0)
+            ok = bool(band_ok and expand_ok)
 
-            adx_strength = clamp((adxv[i] - 15.0) / 25.0, 0.0, 1.0)  # 15..40 mapped
+            # Score: blend how much above thresholds it is (capped)
+            atr_score = clamp((atr_pct - self.cfg.mr_min_atr_pct) / max(1e-12, (self.cfg.mr_max_atr_pct - self.cfg.mr_min_atr_pct)), 0.0, 1.0)
+            exp_score = clamp((ratio - self.cfg.mr_vol_expand_ratio) / max(1e-12, (2.0 - self.cfg.mr_vol_expand_ratio)), 0.0, 1.0) if self.cfg.mr_vol_expand_ratio < 2.0 else clamp(ratio / max(1e-12, self.cfg.mr_vol_expand_ratio), 0.0, 1.0)
+            score = clamp(0.55 * exp_score + 0.45 * atr_score, 0.0, 1.0)
 
-            atr_pct = (a[i] / max(1e-12, price)) if price > 0 else 0.0
-
-            # Strength is blended but penalize if ATR% extreme
-            vol_penalty = 0.0
-            # Ideal ATR% band roughly 0.3% .. 2.5% on higher TF (varies, but good general band)
-            if atr_pct < 0.0025:
-                vol_penalty = clamp((0.0025 - atr_pct) / 0.0025, 0.0, 1.0) * 0.6
-            elif atr_pct > 0.03:
-                vol_penalty = clamp((atr_pct - 0.03) / 0.03, 0.0, 1.0) * 0.7
-
-            strength = clamp(0.55 * adx_strength + 0.45 * slope_strength - vol_penalty, 0.0, 1.0)
-
-            out.append(RegimeState(direction=trend, strength=strength, adx=adxv[i], atr_pct=atr_pct))
-
+            out.append(VolState(atr_pct=float(atr_pct), expand_ratio=float(ratio), ok=ok, score=float(score)))
         return out
 
-    def choose_leverage(self, regime: RegimeState, equity_dd: float) -> float:
+    def choose_leverage(self, vol: VolState, equity_dd: float) -> float:
         """
-        Conservative dynamic leverage:
+        Conservative leverage:
         - base 1x
-        - scale with regime strength
-        - reduce in drawdown
-        - hard cap at cfg.leverage_max
+        - allow up to cfg.leverage_max when vol score high AND drawdown low
+        - reduce leverage quickly in drawdown
         """
         if not self.cfg.leverage_enabled_paper:
             return 1.0
 
-        base = 1.0
-        add = 0.0
+        lev = 1.0
+        if vol.ok:
+            # scale from 1.0 up to cap by score
+            lev = 1.0 + (self.cfg.leverage_max - 1.0) * clamp(vol.score, 0.0, 1.0)
 
-        # Only consider >1x in strong trending regime
-        if regime.direction != 0 and regime.strength >= 0.55 and regime.adx >= 18.0:
-            add = 2.0 * clamp((regime.strength - 0.55) / 0.45, 0.0, 1.0)  # up to +2.0
-
-        lev = base + add
-
-        # Drawdown dampener (equity_dd = current drawdown fraction, 0..1)
+        # drawdown dampener
         if equity_dd > 0.02:
-            lev *= clamp(1.0 - (equity_dd * 6.0), 0.35, 1.0)
+            lev *= clamp(1.0 - equity_dd * 7.0, 0.35, 1.0)
 
         lev = clamp(lev, self.cfg.leverage_min, self.cfg.leverage_max)
         return float(lev)
@@ -926,113 +983,201 @@ class StrategyV2:
         idx_entry: int,
         sig: CandleSeries,
         idx_sig: int,
-        regime: RegimeState,
+        vol: VolState,
         equity_dd: float,
+        cooldown_until_idx: int,
     ) -> EntrySignal:
-        """
-        Long-only (spot-like), leverage simulated by margin rules.
-        """
-        # Regime must be uptrend
-        if regime.direction != +1 or regime.strength < 0.45 or regime.adx < 16.0:
+        # Signal timeframe must be OK
+        if not vol.ok:
             return EntrySignal(
                 action="HOLD", confidence=0.0,
-                reason="Regime not trending up",
-                leverage=1.0, stop_price=0.0, r_value=0.0, meta={"regime": dataclasses.asdict(regime)}
+                reason="Volatility gate off",
+                leverage=1.0, stop_price=0.0, take_profit=0.0, r_value=0.0, max_hold_bars=self.cfg.mr_max_hold_bars,
+                meta={"vol": dataclasses.asdict(vol)}
             )
 
-        # Need enough entry TF candles
-        if idx_entry < 120:
+        # Cooldown after a loss
+        if idx_entry < cooldown_until_idx:
+            return EntrySignal(
+                action="HOLD", confidence=0.0,
+                reason="Cooldown after loss",
+                leverage=1.0, stop_price=0.0, take_profit=0.0, r_value=0.0, max_hold_bars=self.cfg.mr_max_hold_bars,
+                meta={"cooldown_until_idx": cooldown_until_idx, "idx_entry": idx_entry}
+            )
+
+        # Need enough entry TF candles for rolling computations
+        w = self.cfg.mr_window
+        if idx_entry < max(w + 5, self.cfg.mr_atr_period + 10):
             return EntrySignal(
                 action="HOLD", confidence=0.0,
                 reason="Insufficient entry TF history",
-                leverage=1.0, stop_price=0.0, r_value=0.0, meta={"regime": dataclasses.asdict(regime)}
+                leverage=1.0, stop_price=0.0, take_profit=0.0, r_value=0.0, max_hold_bars=self.cfg.mr_max_hold_bars,
+                meta={"need": max(w + 5, self.cfg.mr_atr_period + 10), "idx_entry": idx_entry}
             )
 
-        # Entry indicators
+        # Slice up to idx_entry (inclusive)
         close = entry.c[:idx_entry + 1]
         high = entry.h[:idx_entry + 1]
         low = entry.l[:idx_entry + 1]
+        volm = entry.v[:idx_entry + 1]
 
-        ema50 = ema(close, 50)
-        ema200 = ema(close, 200)
-        r = rsi(close, 14)
-        a = atr(high, low, close, 14)
+        px = close[-1]
+        if px <= 0:
+            return EntrySignal("HOLD", 0.0, "Bad price", 1.0, 0.0, 0.0, 0.0, self.cfg.mr_max_hold_bars, {})
 
-        price = close[-1]
-        if price <= 0:
-            return EntrySignal("HOLD", 0.0, "Bad price", 1.0, 0.0, 0.0, {"regime": dataclasses.asdict(regime)})
+        # ATR sanity (entry TF)
+        atrs = atr(high, low, close, self.cfg.mr_atr_period)
+        atr_now = atrs[-1] if atrs else 0.0
+        atr_pct = (atr_now / px) if px > 1e-12 else 0.0
+        if atr_pct < self.cfg.mr_min_atr_pct:
+            return EntrySignal("HOLD", 0.0, "ATR% too low", 1.0, 0.0, 0.0, 0.0, self.cfg.mr_max_hold_bars, {"atr_pct": atr_pct})
+        if atr_pct > self.cfg.mr_max_atr_pct:
+            return EntrySignal("HOLD", 0.0, "ATR% too high", 1.0, 0.0, 0.0, 0.0, self.cfg.mr_max_hold_bars, {"atr_pct": atr_pct})
 
-        # Trend alignment on entry TF too
-        if ema50[-1] <= ema200[-1] * 1.000:
-            return EntrySignal("HOLD", 0.0, "Entry TF trend not aligned", 1.0, 0.0, 0.0, {"regime": dataclasses.asdict(regime)})
+        # Mean reference
+        vwap = rolling_vwap(close, volm, w)
+        mu, sd = rolling_mean_std(close, w)
+        mid = mu[-1]
+        st = sd[-1]
+        vwap_now = vwap[-1] if vwap else mid
 
-        # Pullback condition: price near EMA50 (not too far above)
-        dist_to_ema50 = (price - ema50[-1]) / max(1e-12, ema50[-1])
-        if dist_to_ema50 > 0.012:
-            return EntrySignal("HOLD", 0.0, "Overextended (too far above EMA50)", 1.0, 0.0, 0.0, {"dist_to_ema50": dist_to_ema50})
+        # Guard: must have valid rolling stats
+        if st <= 1e-12 or mid <= 0:
+            return EntrySignal("HOLD", 0.0, "Rolling stats not ready", 1.0, 0.0, 0.0, 0.0, self.cfg.mr_max_hold_bars, {})
 
-        # Avoid entering during extreme RSI (overheated)
-        if r[-1] >= 72.0:
-            return EntrySignal("HOLD", 0.0, "RSI too high (overheated)", 1.0, 0.0, 0.0, {"rsi": r[-1]})
+        z = (px - vwap_now) / st if st > 1e-12 else 0.0
 
-        # Volatility sanity on entry TF
-        atr_now = a[-1]
-        atr_pct = atr_now / max(1e-12, price)
-        if atr_pct < 0.0012:
-            return EntrySignal("HOLD", 0.0, "ATR% too low (chop risk)", 1.0, 0.0, 0.0, {"atr_pct": atr_pct})
-        if atr_pct > 0.06:
-            return EntrySignal("HOLD", 0.0, "ATR% too high (spike risk)", 1.0, 0.0, 0.0, {"atr_pct": atr_pct})
+        # Bollinger
+        bb_lo, bb_mid, bb_up = bollinger(close, w, self.cfg.mr_bb_k)
+        lo_band = bb_lo[-1]
+        mid_band = bb_mid[-1]
+        up_band = bb_up[-1]
 
-        # Define stop distance using ATR
-        stop_dist = 1.25 * atr_now
-        stop_price = price - stop_dist
-        if stop_price <= 0:
-            return EntrySignal("HOLD", 0.0, "Invalid stop price", 1.0, 0.0, 0.0, {"atr": atr_now})
+        # Short RSI exhaustion
+        rsi_short = rsi(close, period=7)
+        rsi_now = rsi_short[-1] if rsi_short else 50.0
 
-        r_value = price - stop_price  # 1R in price terms
-
-        # Fee-aware minimum R gate: ensure 1R is large enough vs costs
-        # Approx cost (fees+slippage) in price terms for round-trip: bps_total * price
-        bps_total = (self.cfg.backtest_fee_bps + self.cfg.backtest_slippage_bps) / 10000.0
-        est_round_trip_cost = price * bps_total * 2.2  # slightly padded
-        if r_value < est_round_trip_cost * 1.4:
+        # Overextension condition (long-only):
+        # - z below threshold OR price below lower band (with slight penetration)
+        z_ok = z <= -self.cfg.mr_z_enter
+        bb_ok = (px <= lo_band * 1.0005)  # allow tiny tolerance
+        if not (z_ok or bb_ok):
             return EntrySignal(
-                "HOLD", 0.0,
-                "R too small vs estimated costs",
-                1.0, 0.0, 0.0,
-                {"r_value": r_value, "est_cost": est_round_trip_cost, "price": price}
+                action="HOLD",
+                confidence=0.0,
+                reason="No overextension",
+                leverage=1.0, stop_price=0.0, take_profit=0.0, r_value=0.0, max_hold_bars=self.cfg.mr_max_hold_bars,
+                meta={"z": z, "z_enter": self.cfg.mr_z_enter, "px": px, "bb_lo": lo_band}
             )
 
-        # Confidence derived from regime strength + pullback proximity + RSI
-        proximity = clamp(1.0 - abs(dist_to_ema50) / 0.012, 0.0, 1.0)
-        rsi_score = clamp((72.0 - r[-1]) / 22.0, 0.0, 1.0)
-        conf = clamp(0.45 + 0.40 * regime.strength + 0.20 * proximity + 0.10 * rsi_score, 0.0, 0.95)
+        # Exhaustion filter: avoid buying when short RSI still high
+        if rsi_now > 48.0:
+            return EntrySignal(
+                action="HOLD",
+                confidence=0.0,
+                reason="RSI not exhausted",
+                leverage=1.0, stop_price=0.0, take_profit=0.0, r_value=0.0, max_hold_bars=self.cfg.mr_max_hold_bars,
+                meta={"rsi7": rsi_now}
+            )
 
-        lev = self.choose_leverage(regime, equity_dd)
+        # Determine take profit target
+        tp_mode = (self.cfg.mr_tp_mode or "VWAP").upper()
+        if tp_mode == "MID":
+            tp = mid_band if mid_band > 0 else vwap_now
+            tp_reason = "TP=BB_MID"
+        else:
+            tp = vwap_now if vwap_now > 0 else mid_band
+            tp_reason = "TP=VWAP"
+
+        # Stop: ATR based
+        stop = px - self.cfg.mr_atr_stop_mult * atr_now
+        if stop <= 0:
+            return EntrySignal("HOLD", 0.0, "Invalid stop", 1.0, 0.0, 0.0, 0.0, self.cfg.mr_max_hold_bars, {"atr": atr_now})
+
+        r_value = px - stop
+        if r_value <= 0:
+            return EntrySignal("HOLD", 0.0, "Invalid R", 1.0, 0.0, 0.0, 0.0, self.cfg.mr_max_hold_bars, {})
+
+        # Ensure TP offers minimum reward in R
+        exp_reward = max(0.0, tp - px)
+        exp_r = exp_reward / max(1e-12, r_value)
+
+        # Fee/slippage gate: require R and expected reward to dominate costs
+        bps_total = (self.cfg.backtest_fee_bps + self.cfg.backtest_slippage_bps) / 10000.0
+        est_round_trip_cost = px * bps_total * 2.2  # padded
+        # convert cost into "R units"
+        cost_r = est_round_trip_cost / max(1e-12, r_value)
+
+        if exp_r < self.cfg.mr_tp_min_r:
+            return EntrySignal(
+                action="HOLD", confidence=0.0,
+                reason="TP too small vs stop (low R)",
+                leverage=1.0, stop_price=0.0, take_profit=0.0, r_value=0.0, max_hold_bars=self.cfg.mr_max_hold_bars,
+                meta={"exp_r": exp_r, "min_r": self.cfg.mr_tp_min_r, "tp": tp, "px": px, "stop": stop}
+            )
+
+        if cost_r > 0.55:
+            return EntrySignal(
+                action="HOLD", confidence=0.0,
+                reason="Costs too high vs stop distance",
+                leverage=1.0, stop_price=0.0, take_profit=0.0, r_value=0.0, max_hold_bars=self.cfg.mr_max_hold_bars,
+                meta={"cost_r": cost_r, "r_value": r_value, "est_cost": est_round_trip_cost}
+            )
+
+        # Confidence: deeper oversold and higher vol score => higher confidence
+        z_score = clamp((-z) / max(1e-12, self.cfg.mr_z_enter), 0.0, 1.8)  # can exceed 1 a bit
+        bb_penetration = 0.0
+        if lo_band > 0:
+            bb_penetration = clamp((lo_band - px) / lo_band / 0.01, 0.0, 1.0)  # 1% penetration -> 1
+
+        rsi_score = clamp((48.0 - rsi_now) / 20.0, 0.0, 1.0)
+
+        conf = clamp(
+            0.35
+            + 0.35 * clamp(vol.score, 0.0, 1.0)
+            + 0.20 * clamp(z_score, 0.0, 1.0)
+            + 0.10 * clamp(bb_penetration, 0.0, 1.0)
+            + 0.10 * rsi_score
+            - 0.10 * clamp(cost_r, 0.0, 1.0),
+            0.0,
+            0.95
+        )
+
+        lev = self.choose_leverage(vol, equity_dd)
 
         return EntrySignal(
             action="BUY",
             confidence=float(conf),
-            reason="MTF uptrend + pullback",
+            reason=f"Mean reversion entry ({tp_reason})",
             leverage=float(lev),
-            stop_price=float(stop_price),
+            stop_price=float(stop),
+            take_profit=float(tp),
             r_value=float(r_value),
+            max_hold_bars=int(self.cfg.mr_max_hold_bars),
             meta={
-                "price": price,
-                "ema50": ema50[-1],
-                "ema200": ema200[-1],
-                "rsi": r[-1],
+                "px": px,
+                "z": z,
+                "z_enter": self.cfg.mr_z_enter,
+                "z_exit": self.cfg.mr_z_exit,
+                "bb_lo": lo_band,
+                "bb_mid": mid_band,
+                "bb_up": up_band,
+                "vwap": vwap_now,
+                "mid": mid,
+                "std": st,
+                "rsi7": rsi_now,
                 "atr": atr_now,
                 "atr_pct": atr_pct,
-                "dist_to_ema50": dist_to_ema50,
-                "regime": dataclasses.asdict(regime),
+                "exp_r": exp_r,
+                "cost_r": cost_r,
+                "vol": dataclasses.asdict(vol),
                 "equity_dd": equity_dd,
             }
         )
 
 
 # =========================
-# Backtesting (v0.2)
+# Backtesting (v0.3)
 # =========================
 
 @dataclass
@@ -1089,25 +1234,33 @@ class SimPosition:
     qty: float
     entry_price: float
     stop_price: float
+    take_profit: float
     r_value: float
     leverage: float
     margin_used: float
     entry_ts_ms: int
+    entry_idx: int
 
-    # exit management
-    took_partial: bool = False
-    qty_remaining: float = 0.0
-    trail_stop: float = 0.0
+    max_hold_bars: int
+    # tracking
+    bars_held: int = 0
 
 
-class BacktesterV2:
+class BacktesterV3:
     """
-    Long-only with paper leverage simulation.
-    - Position sized by risk_per_trade: risk amount equals max loss at stop.
+    Long-only mean reversion backtest with paper leverage simulation.
+
+    Mechanics:
+    - Size by risk_per_trade: risk amount equals max loss at stop.
     - Leverage affects margin used; liquidation if loss exceeds margin_used*(1-maint_margin_ratio).
-    - Partial exit at +1R; move stop to breakeven; trailing stop thereafter.
+    - Exit rules:
+        * Take profit at target (VWAP or BB mid), intrabar high check.
+        * Stop at stop_price, intrabar low check.
+        * Time stop after max_hold_bars (exit at close).
+        * Reversion exit: if z >= -mr_z_exit (i.e., sufficiently reverted), exit at close.
+    - Cooldown after a losing exit (bars-based).
     """
-    def __init__(self, cfg: AppConfig, log: AppLogger, strategy: StrategyV2):
+    def __init__(self, cfg: AppConfig, log: AppLogger, strategy: StrategyV3):
         self.cfg = cfg
         self.log = log
         self.strategy = strategy
@@ -1124,9 +1277,7 @@ class BacktesterV2:
     def _liquidation_price_long(self, pos: SimPosition) -> float:
         """
         Simplified liquidation:
-        - Liquidation occurs when equity in position <= maintenance margin.
-        - Here we approximate using margin_used and maint_margin_ratio.
-        - loss_at_liq = margin_used * (1 - maint_margin_ratio)
+        - Liquidation occurs when loss exceeds margin_used*(1-maint_margin_ratio).
         """
         loss_cap = pos.margin_used * (1.0 - self.cfg.maint_margin_ratio)
         if pos.qty <= 0 or pos.entry_price <= 0:
@@ -1138,10 +1289,11 @@ class BacktesterV2:
         pair: str,
         entry: CandleSeries,
         signal: CandleSeries,
-        regime_series: list[RegimeState],
+        vol_series: list[VolState],
         initial_equity: float = 100.0
     ) -> BacktestResult:
-        if len(entry.c) < 400 or len(signal.c) < 260 or len(regime_series) != len(signal.c):
+        # Basic data checks
+        if len(entry.c) < max(500, self.cfg.mr_window + 120) or len(signal.c) < 120 or len(vol_series) != len(signal.c):
             return BacktestResult(
                 pair=pair, entry_tf=entry.tf, signal_tf=signal.tf,
                 start_ms=0, end_ms=0,
@@ -1156,141 +1308,168 @@ class BacktesterV2:
         max_dd = 0.0
 
         pos: SimPosition | None = None
+        cooldown_until_idx = -1
 
         trades = 0
         wins = 0
+        trade_pnls: list[float] = []
         trade_returns: list[float] = []
         gross_profit = 0.0
         gross_loss = 0.0
 
         eq_curve: list[tuple[int, float]] = []
 
-        # For drawdown-based leverage control, compute current dd from peak
+        # Precompute entry rolling series for reversion exit check:
+        close = entry.c
+        volm = entry.v
+        w = self.cfg.mr_window
+        vwap_arr = rolling_vwap(close, volm, w)
+        mu_arr, sd_arr = rolling_mean_std(close, w)
+
+        # ATR for stop sanity and optional analysis
+        atr_arr = atr(entry.h, entry.l, entry.c, self.cfg.mr_atr_period)
+
         def equity_drawdown() -> float:
             return (peak - equity) / max(1e-12, peak)
 
-        # Determine mapping from entry candle -> signal candle index
-        # We'll compute regime using last signal candle <= entry timestamp.
         for i in range(0, len(entry.ts)):
             ts = entry.ts[i]
             idx_sig = find_last_index_leq(signal.ts, ts)
             if idx_sig < 0:
                 continue
-            regime = regime_series[idx_sig]
+            vol = vol_series[idx_sig]
 
-            price = entry.c[i]
+            px = entry.c[i]
             hi = entry.h[i]
             lo = entry.l[i]
-            if price <= 0:
+            if px <= 0:
                 continue
 
-            # Update open position (check liquidation, stops, trailing, partial)
+            # Update open position
             if pos is not None:
-                # Liquidation check (intrabar): if low breaches liq price
+                pos.bars_held += 1
+
+                # Liquidation (intrabar) check
                 liq_px = self._liquidation_price_long(pos)
                 if liq_px > 0 and lo <= liq_px:
-                    # Liquidated at liq_px with slippage on sell
                     exit_px = self._apply_slippage(liq_px, "SELL")
-                    notional = pos.qty_remaining * exit_px
+                    notional = pos.qty * exit_px
                     fee = self._fee(notional)
-                    pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
-
-                    # Equity loses the margin used (conservative), plus pnl impact already reflected by mark-to-market.
-                    # We model it directly:
+                    pnl = (exit_px - pos.entry_price) * pos.qty - fee
                     equity += pnl
-                    trades += 1
-                    gross_loss += abs(pnl) if pnl < 0 else 0.0
-                    gross_profit += pnl if pnl > 0 else 0.0
-                    trade_returns.append(pnl / max(1e-12, equity))
-                    pos = None
 
-                    # After liquidation, halt further trading for this run (risk realism)
+                    trades += 1
+                    trade_pnls.append(pnl)
+                    trade_returns.append(pnl / max(1e-12, (equity - pnl)))  # return vs pre-exit equity
+                    gross_profit += pnl if pnl > 0 else 0.0
+                    gross_loss += abs(pnl) if pnl < 0 else 0.0
+                    if pnl > 0:
+                        wins += 1
+                    else:
+                        cooldown_until_idx = i + self.cfg.mr_cooldown_after_loss_bars
+
+                    pos = None
                     eq_curve.append((ts, equity))
                     peak = max(peak, equity)
                     max_dd = max(max_dd, equity_drawdown())
-                    break
+                    break  # stop after liquidation for realism
 
-                # Stop logic (intrabar): if low <= stop / trailing stop
-                active_stop = max(pos.stop_price, pos.trail_stop)
-                if lo <= active_stop:
-                    exit_px = self._apply_slippage(active_stop, "SELL")
-                    notional = pos.qty_remaining * exit_px
+                # Stop check (intrabar)
+                if pos is not None and lo <= pos.stop_price:
+                    exit_px = self._apply_slippage(pos.stop_price, "SELL")
+                    notional = pos.qty * exit_px
                     fee = self._fee(notional)
-                    pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
+                    pnl = (exit_px - pos.entry_price) * pos.qty - fee
                     equity += pnl
+
                     trades += 1
+                    trade_pnls.append(pnl)
+                    trade_returns.append(pnl / max(1e-12, (equity - pnl)))
                     if pnl > 0:
                         wins += 1
                         gross_profit += pnl
                     else:
                         gross_loss += abs(pnl)
-                    trade_returns.append(pnl / max(1e-12, equity))
+                        cooldown_until_idx = i + self.cfg.mr_cooldown_after_loss_bars
                     pos = None
-                else:
-                    # Partial take at +1R (intrabar high check)
-                    tp1 = pos.entry_price + 1.0 * pos.r_value
-                    if (not pos.took_partial) and hi >= tp1:
-                        # Take 30% off at tp1
-                        take_qty = pos.qty_remaining * 0.30
-                        exit_px = self._apply_slippage(tp1, "SELL")
-                        notional = take_qty * exit_px
+
+                # Take profit check (intrabar)
+                if pos is not None and hi >= pos.take_profit:
+                    exit_px = self._apply_slippage(pos.take_profit, "SELL")
+                    notional = pos.qty * exit_px
+                    fee = self._fee(notional)
+                    pnl = (exit_px - pos.entry_price) * pos.qty - fee
+                    equity += pnl
+
+                    trades += 1
+                    trade_pnls.append(pnl)
+                    trade_returns.append(pnl / max(1e-12, (equity - pnl)))
+                    if pnl > 0:
+                        wins += 1
+                        gross_profit += pnl
+                    else:
+                        gross_loss += abs(pnl)
+                        cooldown_until_idx = i + self.cfg.mr_cooldown_after_loss_bars
+                    pos = None
+
+                # Reversion exit or time stop (at close)
+                if pos is not None:
+                    # z-score vs vwap
+                    if i < len(vwap_arr) and i < len(sd_arr) and sd_arr[i] > 1e-12:
+                        z = (px - vwap_arr[i]) / sd_arr[i]
+                    else:
+                        z = 0.0
+
+                    # Exit when reverted sufficiently
+                    if z >= -self.cfg.mr_z_exit:
+                        exit_px = self._apply_slippage(px, "SELL")
+                        notional = pos.qty * exit_px
                         fee = self._fee(notional)
-                        pnl = (exit_px - pos.entry_price) * take_qty - fee
+                        pnl = (exit_px - pos.entry_price) * pos.qty - fee
                         equity += pnl
 
-                        pos.qty_remaining = max(0.0, pos.qty_remaining - take_qty)
-                        pos.took_partial = True
-
-                        # Move stop to breakeven
-                        pos.stop_price = max(pos.stop_price, pos.entry_price)
-
-                        # Initialize trailing stop a bit under price using ATR from entry TF window
-                        # Use last computed ATR approx from last 14 candles ending at i
-                        if i >= 20:
-                            a = atr(entry.h[max(0, i - 80):i + 1], entry.l[max(0, i - 80):i + 1], entry.c[max(0, i - 80):i + 1], 14)
-                            atr_now = a[-1] if a else 0.0
-                            pos.trail_stop = max(pos.trail_stop, price - 2.2 * atr_now)
-
-                    # Trailing update if in profit and partial taken
-                    if pos is not None and pos.took_partial and pos.qty_remaining > 0:
-                        # Update trailing using ATR (short window, efficient)
-                        if i >= 20:
-                            a = atr(entry.h[max(0, i - 80):i + 1], entry.l[max(0, i - 80):i + 1], entry.c[max(0, i - 80):i + 1], 14)
-                            atr_now = a[-1] if a else 0.0
-                            if atr_now > 0:
-                                new_trail = price - 2.4 * atr_now
-                                pos.trail_stop = max(pos.trail_stop, new_trail)
-
-                    # Regime invalidation exit (close remainder if regime flips)
-                    if pos is not None and regime.direction != +1 and pos.qty_remaining > 0:
-                        exit_px = self._apply_slippage(price, "SELL")
-                        notional = pos.qty_remaining * exit_px
-                        fee = self._fee(notional)
-                        pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
-                        equity += pnl
                         trades += 1
+                        trade_pnls.append(pnl)
+                        trade_returns.append(pnl / max(1e-12, (equity - pnl)))
                         if pnl > 0:
                             wins += 1
                             gross_profit += pnl
                         else:
                             gross_loss += abs(pnl)
-                        trade_returns.append(pnl / max(1e-12, equity))
+                            cooldown_until_idx = i + self.cfg.mr_cooldown_after_loss_bars
+                        pos = None
+
+                    # Time stop
+                    elif pos is not None and pos.bars_held >= pos.max_hold_bars:
+                        exit_px = self._apply_slippage(px, "SELL")
+                        notional = pos.qty * exit_px
+                        fee = self._fee(notional)
+                        pnl = (exit_px - pos.entry_price) * pos.qty - fee
+                        equity += pnl
+
+                        trades += 1
+                        trade_pnls.append(pnl)
+                        trade_returns.append(pnl / max(1e-12, (equity - pnl)))
+                        if pnl > 0:
+                            wins += 1
+                            gross_profit += pnl
+                        else:
+                            gross_loss += abs(pnl)
+                            cooldown_until_idx = i + self.cfg.mr_cooldown_after_loss_bars
                         pos = None
 
             # Entry logic if flat
             if pos is None:
-                # Daily loss cap proxy in backtest: stop entering if big drawdown
-                if equity_drawdown() >= 0.25:
-                    # too damaged; stop trading to avoid unrealistic recovery assumptions
+                # drawdown safety: if deep drawdown, stop trading
+                if equity_drawdown() >= 0.30:
                     eq_curve.append((ts, equity))
                     break
 
-                # Need enough entry candles to compute signal
                 idx_sig = find_last_index_leq(signal.ts, ts)
                 if idx_sig < 0:
                     eq_curve.append((ts, equity))
                     continue
-                regime = regime_series[idx_sig]
+                vol = vol_series[idx_sig]
 
                 es = self.strategy.entry_signal(
                     pair=pair,
@@ -1298,24 +1477,23 @@ class BacktesterV2:
                     idx_entry=i,
                     sig=signal,
                     idx_sig=idx_sig,
-                    regime=regime,
+                    vol=vol,
                     equity_dd=equity_drawdown(),
+                    cooldown_until_idx=cooldown_until_idx,
                 )
 
-                if es.action == "BUY" and es.confidence >= 0.62:
-                    # Position sizing:
-                    # risk_amount is max loss at stop (RISK_PER_TRADE * equity)
+                # Threshold is intentionally moderate: mean reversion needs opportunities
+                if es.action == "BUY" and es.confidence >= 0.58:
                     risk_amount = equity * clamp(self.cfg.risk_per_trade, 0.0005, 0.05)
-                    stop_dist = max(1e-9, (entry.c[i] - es.stop_price))
-                    qty = risk_amount / stop_dist  # because loss_at_stop = stop_dist * qty
 
-                    # Apply leverage by margin:
+                    stop_dist = max(1e-9, (px - es.stop_price))
+                    qty = risk_amount / stop_dist
+
                     lev = es.leverage if self.cfg.leverage_enabled_paper else 1.0
                     lev = clamp(lev, self.cfg.leverage_min, self.cfg.leverage_max)
 
-                    entry_px = self._apply_slippage(entry.c[i], "BUY")
+                    entry_px = self._apply_slippage(px, "BUY")
                     notional = qty * entry_px
-
                     if notional <= 0:
                         eq_curve.append((ts, equity))
                         continue
@@ -1323,38 +1501,35 @@ class BacktesterV2:
                     margin_required = notional / lev
                     margin_cap = equity * self.cfg.margin_alloc_cap
 
-                    # Scale down if margin exceeds cap
                     if margin_required > margin_cap:
                         scale = margin_cap / max(1e-12, margin_required)
                         qty *= scale
                         notional = qty * entry_px
                         margin_required = notional / lev
 
-                    # Minimum notional sanity
                     if notional < max(5.0, equity * 0.02):
                         eq_curve.append((ts, equity))
                         continue
 
-                    # Pay fee on entry
+                    # Entry fee
                     entry_fee = self._fee(notional)
                     equity -= entry_fee
 
-                    # Create position
                     pos = SimPosition(
                         pair=pair,
-                        qty=qty,
-                        entry_price=entry_px,
-                        stop_price=es.stop_price,
-                        r_value=es.r_value,
-                        leverage=lev,
-                        margin_used=margin_required,
-                        entry_ts_ms=ts,
-                        took_partial=False,
-                        qty_remaining=qty,
-                        trail_stop=0.0,
+                        qty=float(qty),
+                        entry_price=float(entry_px),
+                        stop_price=float(es.stop_price),
+                        take_profit=float(es.take_profit),
+                        r_value=float(es.r_value),
+                        leverage=float(lev),
+                        margin_used=float(margin_required),
+                        entry_ts_ms=int(ts),
+                        entry_idx=int(i),
+                        max_hold_bars=int(es.max_hold_bars),
+                        bars_held=0,
                     )
 
-            # equity curve and drawdown
             eq_curve.append((ts, equity))
             peak = max(peak, equity)
             max_dd = max(max_dd, equity_drawdown())
@@ -1368,7 +1543,7 @@ class BacktesterV2:
         end_ms = entry.ts[-1] if entry.ts else 0
 
         notes = "OK"
-        if trades < 10:
+        if trades < 12:
             notes = "Low trades"
         if total_return < 0:
             notes = "Negative"
@@ -1392,6 +1567,15 @@ class BacktesterV2:
                 "leverage_cap": self.cfg.leverage_max,
                 "margin_alloc_cap": self.cfg.margin_alloc_cap,
                 "maint_margin_ratio": self.cfg.maint_margin_ratio,
+                "mr_window": self.cfg.mr_window,
+                "mr_z_enter": self.cfg.mr_z_enter,
+                "mr_z_exit": self.cfg.mr_z_exit,
+                "mr_tp_mode": self.cfg.mr_tp_mode,
+                "mr_tp_min_r": self.cfg.mr_tp_min_r,
+                "mr_max_hold_bars": self.cfg.mr_max_hold_bars,
+                "mr_vol_expand_ratio": self.cfg.mr_vol_expand_ratio,
+                "fee_bps": self.cfg.backtest_fee_bps,
+                "slippage_bps": self.cfg.backtest_slippage_bps,
             }
         )
 
@@ -1400,13 +1584,13 @@ class BacktesterV2:
         pair: str,
         entry: CandleSeries,
         signal: CandleSeries,
-        regime_series: list[RegimeState],
+        vol_series: list[VolState],
         initial_equity: float = 100.0
     ) -> BacktestResult:
         # Split by time into 5 segments
         n = len(entry.ts)
-        if n < 800:
-            return self.run(pair, entry, signal, regime_series, initial_equity)
+        if n < 900:
+            return self.run(pair, entry, signal, vol_series, initial_equity)
 
         segments = 5
         seg_size = n // segments
@@ -1424,25 +1608,20 @@ class BacktesterV2:
             a = s * seg_size
             b = (s + 1) * seg_size if s < segments - 1 else n
 
-            # Slice entry series
             e_seg = CandleSeries(
                 pair=entry.pair, tf=entry.tf, duration_sec=entry.duration_sec,
                 ts=entry.ts[a:b], o=entry.o[a:b], h=entry.h[a:b], l=entry.l[a:b], c=entry.c[a:b], v=entry.v[a:b],
             )
-            # For signal series, keep full but mapping uses timestamps; ok.
 
-            res = self.run(pair, e_seg, signal, regime_series, eq)
+            res = self.run(pair, e_seg, signal, vol_series, eq)
             eq = eq * (1.0 + res.total_return)
 
             total_trades += res.trades
             weighted_wins += res.win_rate * res.trades
             worst_dd = max(worst_dd, res.max_drawdown)
             avg_trs.append(res.avg_trade_return)
-
-            # Stitch curve (note: equity curve is local; approximate by scaling)
             all_curve.extend(res.equity_curve)
 
-            # Approx gross profit/loss from profit_factor not stored per seg; ignore here (kept 0)
             if res.total_return > 0:
                 g_profit += res.total_return
             else:
@@ -1452,6 +1631,12 @@ class BacktesterV2:
         total_return = (eq - initial_equity) / max(1e-12, initial_equity)
         avg_tr = sum(avg_trs) / len(avg_trs) if avg_trs else 0.0
         profit_factor = (g_profit / max(1e-12, g_loss)) if g_loss > 0 else (g_profit if g_profit > 0 else 0.0)
+
+        notes = "Walk-forward OK"
+        if total_trades < 12:
+            notes = "Walk-forward OK (Low trades)"
+        if total_return < 0:
+            notes = "Walk-forward OK (Negative)"
 
         return BacktestResult(
             pair=pair,
@@ -1465,12 +1650,17 @@ class BacktesterV2:
             max_drawdown=worst_dd,
             profit_factor=profit_factor,
             avg_trade_return=avg_tr,
-            notes="Walk-forward OK",
+            notes=notes,
             equity_curve=all_curve,
             extra={
                 "paper_leverage_enabled": self.cfg.leverage_enabled_paper,
                 "leverage_cap": self.cfg.leverage_max,
                 "segments": segments,
+                "mr_window": self.cfg.mr_window,
+                "mr_z_enter": self.cfg.mr_z_enter,
+                "mr_z_exit": self.cfg.mr_z_exit,
+                "fee_bps": self.cfg.backtest_fee_bps,
+                "slippage_bps": self.cfg.backtest_slippage_bps,
             }
         )
 
@@ -1510,6 +1700,7 @@ class ReportWriter:
         # JSON full
         try:
             payload = {
+                "app": {"name": APP_NAME, "version": APP_VERSION},
                 "generated_utc": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "context": context,
                 "results": [r.to_dict() for r in results],
@@ -1536,6 +1727,46 @@ class ReportWriter:
         out = {"csv": csv_path, "json": json_path, "txt": txt_path}
         self.log.info(f"Backtest reports saved: csv={csv_path} json={json_path} txt={txt_path}")
         return out
+
+    def make_share_bundle(
+        self,
+        bundle_name: str,
+        include_paths: list[Path],
+        meta: dict[str, t.Any],
+    ) -> Path:
+        """
+        Create a zip bundle in reports folder:
+        - includes selected files (e.g., json/txt/csv/log)
+        - includes a meta.json file with sanitized context (no secrets)
+        """
+        ensure_dir(self.reports_dir)
+        stamp = now_utc().strftime("%Y%m%d_%H%M%S")
+        zip_path = self.reports_dir / f"{bundle_name}_{stamp}.zip"
+
+        # Sanitize meta aggressively (never store env/secrets here)
+        safe_meta = {
+            "app": {"name": APP_NAME, "version": APP_VERSION},
+            "generated_utc": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "meta": meta,
+            "files": [str(p.name) for p in include_paths if p and p.exists()],
+        }
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                # meta.json
+                z.writestr("meta.json", json.dumps(safe_meta, ensure_ascii=False, indent=2))
+                for p in include_paths:
+                    try:
+                        if p and p.exists() and p.is_file():
+                            z.write(p, arcname=p.name)
+                    except Exception:
+                        continue
+            self.log.info(f"Share bundle created: {zip_path}")
+        except Exception as e:
+            self.log.exception("Failed to create share bundle", e)
+            raise
+
+        return zip_path
 
 
 # =========================
@@ -1570,8 +1801,8 @@ class TradingEngine:
         self.storage = storage
         self.notifier = notifier
 
-        self.strategy_v2 = StrategyV2(cfg, log)
-        self.backtester_v2 = BacktesterV2(cfg, log, self.strategy_v2)
+        self.strategy_v3 = StrategyV3(cfg, log)
+        self.backtester_v3 = BacktesterV3(cfg, log, self.strategy_v3)
 
         self._lock = threading.Lock()
         self._running = False
@@ -1629,7 +1860,6 @@ class TradingEngine:
     def ingest_candles(self, pair: str, duration_sec: int, start_ms: int, end_ms: int) -> int:
         total = 0
         since = start_ms
-        # Defensive loop: stop if API returns no new candles or time doesn't advance
         for _ in range(1000):
             if since >= end_ms:
                 break
@@ -1677,13 +1907,13 @@ class TradingEngine:
                 entry_series = self.load_series(pair, entry_tf, start_ms, end_ms)
                 signal_series = self.load_series(pair, signal_tf, start_ms, end_ms)
 
-                # Compute regime on signal TF
-                regimes = self.strategy_v2.compute_regime(signal_series)
+                # Compute vol state on signal TF
+                vol_states = self.strategy_v3.compute_vol_state(signal_series)
 
                 if walk_forward:
-                    res = self.backtester_v2.walk_forward(pair, entry_series, signal_series, regimes, initial_equity=initial_equity)
+                    res = self.backtester_v3.walk_forward(pair, entry_series, signal_series, vol_states, initial_equity=initial_equity)
                 else:
-                    res = self.backtester_v2.run(pair, entry_series, signal_series, regimes, initial_equity=initial_equity)
+                    res = self.backtester_v3.run(pair, entry_series, signal_series, vol_states, initial_equity=initial_equity)
 
                 results.append(res)
 
@@ -1736,13 +1966,8 @@ class TradingEngine:
                 last_trade = safe_float(tkr.get("last_trade"), 0.0)
                 self._last_health = f"OK last={last_trade}"
 
-                if self.cfg.is_paper():
-                    self._paper_reset_day_if_needed()
-                    # Keep engine trading simple in v0.2.0:
-                    # Backtester is the primary evaluation tool; live paper engine stays conservative.
-                    # (We can upgrade paper engine to use StrategyV2 after backtests turn positive.)
-                    pass
-                else:
+                # Live execution remains locked (by design)
+                if not self.cfg.is_paper():
                     self._last_health = "LIVE_LOCKED"
 
             except Exception as e:
@@ -1763,8 +1988,8 @@ class Dashboard(tk.Tk):
     def __init__(self, repo_root: Path):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1250x780")
-        self.minsize(1050, 680)
+        self.geometry("1250x820")
+        self.minsize(1050, 700)
 
         self.repo_root = repo_root
 
@@ -1865,7 +2090,8 @@ class Dashboard(tk.Tk):
         self.btn_stop = ttk.Button(btn_row, text="Stop Engine", command=self._stop_engine)
         self.btn_stop.pack(side=tk.LEFT, padx=(0, 8))
 
-        ttk.Button(btn_row, text="Export Logs", command=self._export_logs).pack(side=tk.LEFT)
+        ttk.Button(btn_row, text="Export Logs", command=self._export_logs).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="Create Share Bundle", command=self._create_share_bundle).pack(side=tk.LEFT)
 
         ttk.Separator(controls, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
 
@@ -1900,13 +2126,14 @@ class Dashboard(tk.Tk):
 
         ttk.Button(row3, text="Run Backtest", command=self._run_backtest).pack(side=tk.LEFT, padx=10)
         ttk.Button(row3, text="Copy Summary", command=self._copy_backtest_summary).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row3, text="Copy JSON (Latest)", command=self._copy_backtest_json).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row3, text="Export Backtest Report", command=self._export_backtest_report).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row3, text="Open Reports Folder", command=self._open_reports_folder).pack(side=tk.LEFT)
 
         self.tbl_bt = self._make_table(
             right,
             title="Backtest Results (sorted by return)",
-            columns=[("pair", 90), ("entry", 70), ("signal", 70), ("trades", 70), ("win", 70), ("ret", 90), ("dd", 80), ("notes", 170)]
+            columns=[("pair", 90), ("entry", 70), ("signal", 70), ("trades", 70), ("win", 70), ("ret", 90), ("dd", 80), ("notes", 200)]
         )
         self.tbl_bt.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
 
@@ -1936,8 +2163,8 @@ class Dashboard(tk.Tk):
     def _show_startup_notice(self) -> None:
         msg = (
             "PAPER mode is recommended while optimizing backtests.\n\n"
-            "This software includes risk controls and paper leverage simulation.\n"
-            "There is no guarantee of profit; use read-only keys for data access and testing.\n"
+            "This build uses a volatility-expansion + mean-reversion engine.\n"
+            "Live execution remains locked.\n"
         )
         messagebox.showinfo(f"{APP_NAME}", msg)
 
@@ -1979,9 +2206,32 @@ class Dashboard(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(summary)
             self.update()
-            messagebox.showinfo("Copy Summary", "Copied backtest summary to clipboard. Paste it into chat.")
+            messagebox.showinfo("Copy Summary", "Copied backtest summary to clipboard.")
         except Exception as e:
             messagebox.showerror("Copy Summary", f"Failed: {e}")
+
+    def _copy_backtest_json(self) -> None:
+        """
+        Copies a compact JSON payload (context + results summary) to clipboard.
+        This makes it easy to paste results without screenshots.
+        """
+        if not self._last_backtest_results:
+            messagebox.showwarning("Copy JSON", "Run a backtest first.")
+            return
+        payload = {
+            "app": {"name": APP_NAME, "version": APP_VERSION},
+            "generated_utc": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "context": self._last_backtest_context,
+            "top": [r.to_dict() for r in self._last_backtest_results[:10]],
+        }
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            messagebox.showinfo("Copy JSON", "Copied JSON (top 10 + context) to clipboard.")
+        except Exception as e:
+            messagebox.showerror("Copy JSON", f"Failed: {e}")
 
     def _compose_backtest_summary_text(self) -> str:
         ctx = self._last_backtest_context or {}
@@ -2018,6 +2268,39 @@ class Dashboard(tk.Tk):
         except Exception as e:
             messagebox.showerror("Export Backtest Report", f"Failed: {e}")
 
+    def _create_share_bundle(self) -> None:
+        """
+        Creates a single zip file in reports/ that you can upload or share.
+        It includes:
+        - latest backtest txt/json/csv if available
+        - lunobiz.log (if exists)
+        - meta.json (sanitized, no secrets)
+        """
+        include: list[Path] = []
+        try:
+            if self._last_backtest_report_paths:
+                for k in ("txt", "json", "csv"):
+                    p = self._last_backtest_report_paths.get(k)
+                    if p and p.exists():
+                        include.append(p)
+            # include logs
+            log_path = self.cfg.data_dir / "lunobiz.log"
+            if log_path.exists():
+                include.append(log_path)
+
+            if not include:
+                messagebox.showwarning("Share Bundle", "No reports/logs found yet. Run backtest and export report first.")
+                return
+
+            meta = {
+                "context": self._last_backtest_context,
+                "note": "Bundle contains reports and logs only. No secrets are included.",
+            }
+            zip_path = self.reports.make_share_bundle("share_bundle", include, meta)
+            messagebox.showinfo("Share Bundle", f"Created:\n{zip_path}\n\nYou can upload this zip for review.")
+        except Exception as e:
+            messagebox.showerror("Share Bundle", f"Failed: {e}")
+
     def _run_backtest(self) -> None:
         if self._backtest_thread and self._backtest_thread.is_alive():
             messagebox.showwarning("Backtest", "Backtest already running.")
@@ -2030,8 +2313,8 @@ class Dashboard(tk.Tk):
             return
 
         entry_tf = self.var_bt_tf.get().strip()
-        days = safe_int(self.var_bt_days.get().strip(), 180)
-        eq = safe_float(self.var_bt_equity.get().strip(), 100.0)
+        days = max(1, safe_int(self.var_bt_days.get().strip(), 180))
+        eq = max(1.0, safe_float(self.var_bt_equity.get().strip(), 100.0))
         walk = bool(self.var_bt_walk.get())
 
         def worker() -> None:
@@ -2052,6 +2335,14 @@ class Dashboard(tk.Tk):
                     "paper_leverage_max": self.cfg.leverage_max,
                     "margin_alloc_cap": self.cfg.margin_alloc_cap,
                     "maint_margin_ratio": self.cfg.maint_margin_ratio,
+                    "mr_window": self.cfg.mr_window,
+                    "mr_z_enter": self.cfg.mr_z_enter,
+                    "mr_z_exit": self.cfg.mr_z_exit,
+                    "mr_bb_k": self.cfg.mr_bb_k,
+                    "mr_tp_mode": self.cfg.mr_tp_mode,
+                    "mr_tp_min_r": self.cfg.mr_tp_min_r,
+                    "mr_max_hold_bars": self.cfg.mr_max_hold_bars,
+                    "mr_vol_expand_ratio": self.cfg.mr_vol_expand_ratio,
                 }
                 self._last_backtest_results = res
                 self._last_backtest_context = ctx
@@ -2059,11 +2350,11 @@ class Dashboard(tk.Tk):
 
                 self._ui_queue.put(lambda: self._render_backtest_results(res))
 
-                # Conservative live gate (still not executing live in v0.2.0):
-                # require top result positive and controlled drawdown with enough trades.
+                # Conservative gate: still locked by default
+                # Only set LIVE_GATE=1 if top result is strongly positive with controlled DD and enough trades.
                 if res:
                     top = res[0]
-                    gate_ok = (top.total_return > 0.10 and top.max_drawdown < 0.20 and top.trades >= 20)
+                    gate_ok = (top.total_return > 0.12 and top.max_drawdown < 0.18 and top.trades >= 30)
                     self.engine.storage.set_gate("LIVE_GATE", "1" if gate_ok else "0")
                     self.log.info(
                         f"Gate eval: top_return={fmt_pct(top.total_return)} dd={fmt_pct(top.max_drawdown)} "
