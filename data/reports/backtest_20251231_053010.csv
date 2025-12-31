@@ -1,0 +1,5 @@
+pair,entry_tf,signal_tf,start_utc,end_utc,trades,win_rate,total_return,max_drawdown,profit_factor,avg_trade_return,notes
+BTCMYR,15m,1h,"2025-07-04 05:30:00 UTC","2025-12-31 05:00:00 UTC",3,0.333333,-0.001150,0.001673,0.654946,0.000067,"Walk-forward OK (Negative)"
+ETHMYR,15m,1h,"2025-07-04 05:30:00 UTC","2025-12-31 05:00:00 UTC",25,0.480000,-0.035329,0.030356,0.289056,-0.000289,"Walk-forward OK (Negative)"
+XRPMYR,15m,1h,"2025-07-04 05:30:00 UTC","2025-12-31 05:00:00 UTC",33,0.454545,-0.046148,0.036802,0.357678,-0.002634,"Walk-forward OK (Negative)"
+SOLMYR,15m,1h,"2025-07-04 05:30:00 UTC","2025-12-31 05:00:00 UTC",30,0.333333,-0.078118,0.034709,0.000000,-0.003375,"Walk-forward OK (Negative)"

@@ -1,0 +1,28 @@
+LunoBiz 0.3.0 BACKTEST SUMMARY
+Generated: 2025-12-31 05:30:11 UTC
+pairs: ETHMYR,BTCMYR,XRPMYR,SOLMYR
+entry_timeframe: 15m
+signal_timeframe: 1h
+days: 180
+initial_equity: 100.0
+walk_forward: True
+slippage_bps: 8.0
+fee_bps: 20.0
+paper_leverage_enabled: True
+paper_leverage_max: 2.0
+margin_alloc_cap: 0.6
+maint_margin_ratio: 0.35
+mr_window: 80
+mr_z_enter: 2.0
+mr_z_exit: 0.6
+mr_bb_k: 2.0
+mr_tp_mode: VWAP
+mr_tp_min_r: 0.9
+mr_max_hold_bars: 24
+mr_vol_expand_ratio: 1.15
+
+Top Results:
+ - BTCMYR entry=15m signal=1h trades=3 win=33.3% ret=-0.12% dd=0.17% notes=Walk-forward OK (Negative)
+ - ETHMYR entry=15m signal=1h trades=25 win=48.0% ret=-3.53% dd=3.04% notes=Walk-forward OK (Negative)
+ - XRPMYR entry=15m signal=1h trades=33 win=45.5% ret=-4.61% dd=3.68% notes=Walk-forward OK (Negative)
+ - SOLMYR entry=15m signal=1h trades=30 win=33.3% ret=-7.81% dd=3.47% notes=Walk-forward OK (Negative)
