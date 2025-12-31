@@ -1,15 +1,13 @@
 """
-LunoBiz - Single-file Windows application (v0.3.1)
+LunoBiz - Single-file Windows application (v0.3.2)
 
 Key features:
-- GUI dashboard (values & tables only)
+- GUI dashboard (values & tables; no charts)
 - Robust candle caching in SQLite
 - Backtesting with walk-forward validation
-- Paper trading engine (light loop; backtester is primary evaluation tool)
+- Strategy parameters editable via GUI (persisted to SQLite)
+- Volatility Continuation Engine (long-only; paper/backtest)
 - Paper-only leverage simulation (no live execution)
-- Option A: Volatility / Mean-Reversion Engine (StrategyV3)
-- GUI-controllable strategy parameters (no .env editing required)
-- Strategy parameters persisted in SQLite and embedded into backtest reports
 - Safety controls: kill switch, live gate (still locked by default)
 
 Public-repo safe:
@@ -54,7 +52,8 @@ except Exception as e:
 # =========================
 
 APP_NAME = "LunoBiz"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
+
 DEFAULT_API_BASE = "https://api.luno.com"
 
 # Luno endpoints
@@ -73,8 +72,9 @@ KILL_SWITCH_FILE = "KILL_SWITCH"
 # Reporting
 REPORTS_DIRNAME = "reports"
 
-# DB keys
-STRATEGY_PARAMS_KEY = "strategy_params_v3"
+# Storage keys
+GATE_STRAT_PARAMS_JSON = "STRAT_PARAMS_JSON"
+GATE_LIVE_GATE = "LIVE_GATE"
 
 
 # =========================
@@ -172,16 +172,6 @@ def open_folder_in_explorer(folder: Path) -> None:
         pass
 
 
-def safe_json_dumps(obj: t.Any) -> str:
-    try:
-        return json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
-    except Exception:
-        try:
-            return json.dumps(str(obj), ensure_ascii=False, indent=2, sort_keys=True)
-        except Exception:
-            return "{}"
-
-
 # =========================
 # .env loader (no extra deps)
 # =========================
@@ -261,7 +251,6 @@ class AppLogger:
         line = f"[{ts} UTC] {level.upper():<5} {msg}"
         self._q.put((level.upper(), line))
         try:
-            ensure_dir(self._data_dir)
             with self._log_file.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
@@ -294,7 +283,7 @@ class AppLogger:
 # Config
 # =========================
 
-@dataclass
+@dataclass(frozen=True)
 class AppConfig:
     luno_api_key_readonly: str
     luno_api_secret_readonly: str
@@ -316,17 +305,17 @@ class AppConfig:
     cooldown_minutes: int
 
     # Backtest parameters
-    backtest_timeframe: str         # entry timeframe
-    signal_timeframe: str           # higher timeframe for regime
+    backtest_timeframe: str
+    signal_timeframe: str
     backtest_slippage_bps: float
     backtest_fee_bps: float
 
     # Paper leverage simulation
     leverage_enabled_paper: bool
-    leverage_max: float             # hard cap
-    leverage_min: float             # typically 1
-    margin_alloc_cap: float         # cap margin usage fraction of equity per position
-    maint_margin_ratio: float       # simplistic maintenance margin ratio
+    leverage_max: float
+    leverage_min: float
+    margin_alloc_cap: float
+    maint_margin_ratio: float
 
     data_dir: Path
     db_filename: str
@@ -465,12 +454,6 @@ class Storage:
                     value TEXT NOT NULL,
                     updated_ms INTEGER NOT NULL
                 );
-
-                CREATE TABLE IF NOT EXISTS kv_store (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_ms INTEGER NOT NULL
-                );
                 """)
                 con.commit()
             finally:
@@ -567,32 +550,6 @@ class Storage:
             finally:
                 con.close()
 
-    # ---- KV store for persisted GUI parameters ----
-
-    def kv_set(self, key: str, value: str) -> None:
-        with self._lock:
-            con = self._connect()
-            try:
-                con.execute("""
-                    INSERT INTO kv_store(key, value, updated_ms)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_ms=excluded.updated_ms
-                """, (key, value, utc_ms()))
-                con.commit()
-            finally:
-                con.close()
-
-    def kv_get(self, key: str, default: str = "") -> str:
-        with self._lock:
-            con = self._connect()
-            try:
-                cur = con.cursor()
-                cur.execute("SELECT value FROM kv_store WHERE key=?", (key,))
-                row = cur.fetchone()
-                return str(row["value"]) if row else default
-            finally:
-                con.close()
-
 
 # =========================
 # Notifications (Telegram optional)
@@ -642,13 +599,7 @@ class LunoClient:
         token = base64.b64encode(f"{key}:{sec}".encode("utf-8")).decode("ascii")
         return {"Authorization": f"Basic {token}"}
 
-    def _request(
-        self,
-        method: str,
-        path: str,
-        params: dict[str, t.Any] | None = None,
-        data: dict[str, t.Any] | None = None
-    ) -> dict[str, t.Any]:
+    def _request(self, method: str, path: str, params: dict[str, t.Any] | None = None, data: dict[str, t.Any] | None = None) -> dict[str, t.Any]:
         url = f"{self.base}{path}"
         headers = {"Accept": "application/json"}
         headers.update(self._auth_header())
@@ -715,42 +666,6 @@ class LunoClient:
 # Indicators
 # =========================
 
-def sma(values: list[float], period: int) -> list[float]:
-    if period <= 1 or not values:
-        return values[:]
-    out: list[float] = []
-    s = 0.0
-    q: list[float] = []
-    for v in values:
-        q.append(v)
-        s += v
-        if len(q) > period:
-            s -= q.pop(0)
-        if len(q) < period:
-            out.append(q[-1])
-        else:
-            out.append(s / period)
-    return out
-
-
-def stdev(values: list[float], period: int) -> list[float]:
-    if period <= 1 or not values:
-        return [0.0] * len(values)
-    out: list[float] = []
-    q: list[float] = []
-    for v in values:
-        q.append(v)
-        if len(q) > period:
-            q.pop(0)
-        if len(q) < period:
-            out.append(0.0)
-        else:
-            m = sum(q) / period
-            var = sum((x - m) ** 2 for x in q) / period
-            out.append(math.sqrt(max(0.0, var)))
-    return out
-
-
 def ema(values: list[float], period: int) -> list[float]:
     if period <= 1 or len(values) == 0:
         return values[:]
@@ -761,6 +676,21 @@ def ema(values: list[float], period: int) -> list[float]:
     for v in values[1:]:
         prev = prev + k * (v - prev)
         out.append(prev)
+    return out
+
+
+def sma(values: list[float], period: int) -> list[float]:
+    if period <= 1:
+        return values[:]
+    out: list[float] = []
+    s = 0.0
+    q: list[float] = []
+    for v in values:
+        q.append(v)
+        s += v
+        if len(q) > period:
+            s -= q.pop(0)
+        out.append(s / len(q))
     return out
 
 
@@ -798,6 +728,42 @@ def atr(high: list[float], low: list[float], close: list[float], period: int = 1
     return ema(tr, period)
 
 
+def stdev(values: list[float], period: int) -> list[float]:
+    if period <= 1:
+        return [0.0] * len(values)
+    out: list[float] = []
+    q: list[float] = []
+    for v in values:
+        q.append(v)
+        if len(q) > period:
+            q.pop(0)
+        if len(q) < 2:
+            out.append(0.0)
+        else:
+            m = sum(q) / len(q)
+            var = sum((x - m) ** 2 for x in q) / max(1, (len(q) - 1))
+            out.append(math.sqrt(max(0.0, var)))
+    return out
+
+
+def rolling_median(values: list[float], period: int) -> list[float]:
+    if period <= 1:
+        return values[:]
+    out: list[float] = []
+    q: list[float] = []
+    for v in values:
+        q.append(v)
+        if len(q) > period:
+            q.pop(0)
+        s = sorted(q)
+        mid = len(s) // 2
+        if len(s) % 2 == 1:
+            out.append(s[mid])
+        else:
+            out.append(0.5 * (s[mid - 1] + s[mid]))
+    return out
+
+
 def adx(high: list[float], low: list[float], close: list[float], period: int = 14) -> list[float]:
     """
     Wilder's ADX implementation (sufficient for regime filtering).
@@ -822,8 +788,8 @@ def adx(high: list[float], low: list[float], close: list[float], period: int = 1
         out = [0.0] * n
         s = sum(series[1:p + 1])
         out[p] = s
-        for i in range(p + 1, n):
-            out[i] = out[i - 1] - (out[i - 1] / p) + series[i]
+        for j in range(p + 1, n):
+            out[j] = out[j - 1] - (out[j - 1] / p) + series[j]
         return out
 
     atr_s = wilder_smooth(tr, period)
@@ -847,6 +813,67 @@ def adx(high: list[float], low: list[float], close: list[float], period: int = 1
         adx_out[i] = ((adx_out[i - 1] * (period - 1)) + dx[i]) / period
 
     return adx_out
+
+
+def zscore(values: list[float], lookback: int) -> list[float]:
+    if lookback <= 2:
+        return [0.0] * len(values)
+    out: list[float] = []
+    q: list[float] = []
+    s = 0.0
+    ss = 0.0
+    for v in values:
+        q.append(v)
+        s += v
+        ss += v * v
+        if len(q) > lookback:
+            old = q.pop(0)
+            s -= old
+            ss -= old * old
+        n = len(q)
+        if n < 3:
+            out.append(0.0)
+            continue
+        mean = s / n
+        var = max(0.0, (ss / n) - (mean * mean))
+        sd = math.sqrt(var) if var > 1e-18 else 0.0
+        out.append((v - mean) / (sd + 1e-12))
+    return out
+
+
+def rolling_vwap(close: list[float], volume: list[float], lookback: int) -> list[float]:
+    """
+    Rolling VWAP using close*volume.
+    """
+    if lookback <= 1:
+        return close[:]
+    out: list[float] = []
+    q_pv: list[float] = []
+    q_v: list[float] = []
+    s_pv = 0.0
+    s_v = 0.0
+    for p, v in zip(close, volume):
+        pv = p * v
+        q_pv.append(pv)
+        q_v.append(v)
+        s_pv += pv
+        s_v += v
+        if len(q_pv) > lookback:
+            s_pv -= q_pv.pop(0)
+            s_v -= q_v.pop(0)
+        out.append((s_pv / (s_v + 1e-12)) if s_v > 0 else p)
+    return out
+
+
+def bollinger(close: list[float], length: int, mult: float) -> tuple[list[float], list[float], list[float]]:
+    mid = sma(close, length)
+    sd = stdev(close, length)
+    upper: list[float] = []
+    lower: list[float] = []
+    for m, s in zip(mid, sd):
+        upper.append(m + mult * s)
+        lower.append(m - mult * s)
+    return mid, upper, lower
 
 
 # =========================
@@ -884,9 +911,6 @@ def build_series_from_rows(pair: str, tf: str, duration_sec: int, rows: list[sql
 
 
 def find_last_index_leq(ts_list: list[int], t_ms: int) -> int:
-    """
-    Binary search: last index where ts <= t_ms, else -1.
-    """
     lo, hi = 0, len(ts_list) - 1
     ans = -1
     while lo <= hi:
@@ -900,128 +924,114 @@ def find_last_index_leq(ts_list: list[int], t_ms: int) -> int:
 
 
 # =========================
-# Strategy Parameters (GUI-controlled, persisted)
+# Strategy Params (GUI-controllable)
 # =========================
 
 @dataclass
-class StrategyParamsV3:
-    """
-    Option A (Volatility / Mean-Reversion Engine) parameters.
-    All fields are GUI-editable and persisted in SQLite.
+class StrategyParamsV32:
+    # Core filters
+    z_lookback: int = 60
+    z_reentry: float = 0.55              # breakout strength in zscore terms
+    z_neutral_band: float = 0.35         # require prior z within ±band (compression)
+    z_exit_revert: float = 0.15          # exit when z reverts toward 0
 
-    Notes:
-    - This is long-only (spot-like), leverage is simulated (paper only).
-    - Parameters must be tuned via backtest + walk-forward validation.
-    """
+    vwap_lookback: int = 80
 
-    # Core mean-reversion signal (z-score of log price vs rolling mean)
-    z_lookback: int = 120
-    z_enter: float = 1.75          # enter when z <= -z_enter
-    z_exit: float = 0.35           # exit when z >= -z_exit (reversion toward mean)
+    bb_len: int = 60
+    bb_mult: float = 1.6
+    squeeze_bw_lookback: int = 120       # for percentile-ish squeeze check via median
+    squeeze_bw_mult: float = 0.80        # current bb_width < median(bb_width)*mult => squeeze
 
-    # Bollinger confirmation / fallback
-    bb_len: int = 120
-    bb_mult: float = 2.0           # BB = SMA +/- mult*stdev
-    bb_enter_pct: float = 0.02     # require price <= lowerBB*(1+bb_enter_pct) for extra confirmation (0.02=2%)
-    bb_exit_mid: bool = True       # allow exit at mid-band
-
-    # RSI guard
-    rsi_len: int = 14
-    rsi_oversold: float = 33.0     # require RSI <= oversold to enter
-
-    # Volatility filters (ATR%)
     atr_len: int = 14
-    atr_min_pct: float = 0.0012    # avoid dead chop
-    atr_max_pct: float = 0.0600    # avoid extreme spikes
-    atr_stop_mult: float = 2.2     # stop distance = atr_stop_mult * ATR(entry_tf)
+    atr_expand_mult: float = 1.15        # current atr% > median(atr%)*mult => expansion
+    atr_min_pct: float = 0.0010
+    atr_max_pct: float = 0.055
+    atr_stop_mult: float = 1.35
 
-    # Trend filter (avoid strong trends that crush MR)
+    rsi_len: int = 7
+    rsi_min_for_long: float = 52.0       # momentum confirmation
+    rsi_overheat: float = 78.0           # avoid too stretched entries
+
     adx_len: int = 14
-    adx_max_for_mr: float = 22.0   # only mean-revert if ADX <= this threshold on signal TF
+    adx_min_rising: float = 14.0         # allow if adx above threshold
+    adx_max_entry: float = 38.0          # avoid late-stage blowoff
 
-    # Position/exit management
-    confidence_min: float = 0.62
-    max_bars_hold: int = 220       # time stop
-    take_partial_at_r: float = 0.75  # partial at +X R
-    partial_qty_frac: float = 0.35
+    momentum_confirm_bars: int = 3       # close now > close[-k]
+    cooldown_bars_after_exit: int = 6    # prevent immediate re-entry chop
 
-    # Cost-awareness gate
-    min_r_vs_cost_mult: float = 1.35  # require 1R >= cost * mult
+    # Execution & management
+    confidence_min: float = 0.48
+    max_bars_hold: int = 140
+    take_partial_at_r: float = 0.70
+    partial_qty_frac: float = 0.40
+    trail_atr_mult: float = 1.80
+    min_r_vs_cost_mult: float = 1.10
 
-    # Leverage heuristic (paper only)
+    # Leverage (paper only)
     lev_base: float = 1.0
-    lev_max: float = 2.0
-    lev_scale_by_signal: float = 1.0  # add up to (lev_max-lev_base) scaled by confidence
+    lev_max: float = 1.6
+    lev_scale_by_signal: float = 0.8     # scale by regime strength
 
-    def sanitize(self) -> "StrategyParamsV3":
+    def sanitize(self) -> "StrategyParamsV32":
+        # Defensive clamps (prevents GUI bad input from crashing / invalidating runs)
         p = dataclasses.replace(self)
-
-        p.z_lookback = int(clamp(float(p.z_lookback), 20, 800))
-        p.z_enter = clamp(float(p.z_enter), 0.6, 6.0)
-        p.z_exit = clamp(float(p.z_exit), 0.05, 2.0)
-
-        p.bb_len = int(clamp(float(p.bb_len), 20, 800))
-        p.bb_mult = clamp(float(p.bb_mult), 0.8, 4.0)
-        p.bb_enter_pct = clamp(float(p.bb_enter_pct), 0.0, 0.20)
-
-        p.rsi_len = int(clamp(float(p.rsi_len), 2, 50))
-        p.rsi_oversold = clamp(float(p.rsi_oversold), 5.0, 55.0)
-
-        p.atr_len = int(clamp(float(p.atr_len), 2, 100))
-        p.atr_min_pct = clamp(float(p.atr_min_pct), 0.0, 0.03)
-        p.atr_max_pct = clamp(float(p.atr_max_pct), 0.01, 0.20)
-        if p.atr_max_pct < p.atr_min_pct:
-            p.atr_max_pct = max(p.atr_min_pct + 0.005, p.atr_max_pct)
-
-        p.atr_stop_mult = clamp(float(p.atr_stop_mult), 0.8, 8.0)
-
-        p.adx_len = int(clamp(float(p.adx_len), 2, 50))
-        p.adx_max_for_mr = clamp(float(p.adx_max_for_mr), 8.0, 45.0)
-
-        p.confidence_min = clamp(float(p.confidence_min), 0.20, 0.95)
-        p.max_bars_hold = int(clamp(float(p.max_bars_hold), 10, 5000))
-        p.take_partial_at_r = clamp(float(p.take_partial_at_r), 0.25, 3.0)
-        p.partial_qty_frac = clamp(float(p.partial_qty_frac), 0.05, 0.90)
-
-        p.min_r_vs_cost_mult = clamp(float(p.min_r_vs_cost_mult), 0.50, 5.0)
-
-        p.lev_base = clamp(float(p.lev_base), 1.0, 6.0)
-        p.lev_max = clamp(float(p.lev_max), p.lev_base, 10.0)
-        p.lev_scale_by_signal = clamp(float(p.lev_scale_by_signal), 0.0, 2.0)
-
+        p.z_lookback = int(clamp(p.z_lookback, 20, 400))
+        p.z_reentry = float(clamp(p.z_reentry, 0.10, 3.0))
+        p.z_neutral_band = float(clamp(p.z_neutral_band, 0.05, 2.0))
+        p.z_exit_revert = float(clamp(p.z_exit_revert, 0.01, 1.0))
+        p.vwap_lookback = int(clamp(p.vwap_lookback, 20, 400))
+        p.bb_len = int(clamp(p.bb_len, 20, 400))
+        p.bb_mult = float(clamp(p.bb_mult, 0.8, 4.0))
+        p.squeeze_bw_lookback = int(clamp(p.squeeze_bw_lookback, 40, 600))
+        p.squeeze_bw_mult = float(clamp(p.squeeze_bw_mult, 0.20, 1.20))
+        p.atr_len = int(clamp(p.atr_len, 5, 50))
+        p.atr_expand_mult = float(clamp(p.atr_expand_mult, 0.80, 1.80))
+        p.atr_min_pct = float(clamp(p.atr_min_pct, 0.0001, 0.02))
+        p.atr_max_pct = float(clamp(p.atr_max_pct, 0.01, 0.20))
+        p.atr_stop_mult = float(clamp(p.atr_stop_mult, 0.5, 5.0))
+        p.rsi_len = int(clamp(p.rsi_len, 3, 30))
+        p.rsi_min_for_long = float(clamp(p.rsi_min_for_long, 40.0, 70.0))
+        p.rsi_overheat = float(clamp(p.rsi_overheat, 60.0, 95.0))
+        p.adx_len = int(clamp(p.adx_len, 5, 30))
+        p.adx_min_rising = float(clamp(p.adx_min_rising, 5.0, 40.0))
+        p.adx_max_entry = float(clamp(p.adx_max_entry, 10.0, 80.0))
+        p.momentum_confirm_bars = int(clamp(p.momentum_confirm_bars, 1, 12))
+        p.cooldown_bars_after_exit = int(clamp(p.cooldown_bars_after_exit, 0, 60))
+        p.confidence_min = float(clamp(p.confidence_min, 0.05, 0.95))
+        p.max_bars_hold = int(clamp(p.max_bars_hold, 20, 1000))
+        p.take_partial_at_r = float(clamp(p.take_partial_at_r, 0.10, 3.0))
+        p.partial_qty_frac = float(clamp(p.partial_qty_frac, 0.05, 0.95))
+        p.trail_atr_mult = float(clamp(p.trail_atr_mult, 0.5, 8.0))
+        p.min_r_vs_cost_mult = float(clamp(p.min_r_vs_cost_mult, 0.5, 5.0))
+        p.lev_base = float(clamp(p.lev_base, 1.0, 3.0))
+        p.lev_max = float(clamp(p.lev_max, 1.0, 6.0))
+        p.lev_scale_by_signal = float(clamp(p.lev_scale_by_signal, 0.0, 2.0))
         return p
 
     def to_json(self) -> str:
-        return safe_json_dumps(dataclasses.asdict(self))
+        return json.dumps(dataclasses.asdict(self), ensure_ascii=False, indent=2)
 
     @staticmethod
-    def from_json(s: str) -> "StrategyParamsV3":
+    def from_json(text: str) -> "StrategyParamsV32":
         try:
-            d = json.loads(s) if s else {}
-            if not isinstance(d, dict):
-                return StrategyParamsV3()
-            # tolerate missing keys
-            base = StrategyParamsV3()
-            kw = {}
-            for f in dataclasses.fields(base):
-                if f.name in d:
-                    kw[f.name] = d[f.name]
-            p = StrategyParamsV3(**kw)  # type: ignore[arg-type]
-            return p.sanitize()
+            obj = json.loads(text)
+            if not isinstance(obj, dict):
+                return StrategyParamsV32()
+            # Use defaults for missing keys
+            base = dataclasses.asdict(StrategyParamsV32())
+            base.update({k: obj.get(k, base.get(k)) for k in base.keys()})
+            return StrategyParamsV32(**base).sanitize()
         except Exception:
-            return StrategyParamsV3()
+            return StrategyParamsV32()
 
 
 # =========================
-# Strategy v0.3 (Option A: Volatility / Mean-Reversion Engine)
+# Strategy v0.3.2 (Volatility Continuation)
 # =========================
 
 @dataclass
 class RegimeState:
-    """
-    Regime computed on signal timeframe.
-    For mean-reversion, we mainly use ADX as "trend strength" filter.
-    """
+    strength: float  # 0..1
     adx: float
     atr_pct: float
 
@@ -1037,205 +1047,216 @@ class EntrySignal:
     meta: dict[str, t.Any]
 
 
-class StrategyV3:
+class StrategyV32:
     """
-    Option A: Volatility / Mean-Reversion Engine
+    Volatility Continuation Engine (Long-only):
+    - Identify volatility compression (squeeze)
+    - Enter on expansion + directional breakout confirmation
+    - Exit on mean reversion (z back toward 0) or momentum fade/time stop
 
-    - Uses z-score of log-price vs rolling mean on ENTRY TF as primary entry trigger.
-    - Uses signal TF ADX to avoid strong trends (mean reversion tends to fail in strong trends).
-    - Uses ATR% band to avoid dead chop and extreme spikes.
-    - Uses RSI as oversold guard to reduce false entries.
-    - Exits on reversion (z crosses toward mean), time stop, stop-loss, and optional BB mid-band.
-
-    All parameters are GUI-controlled via StrategyParamsV3 and persisted in SQLite.
+    Uses entry timeframe candles only for speed/robustness.
+    Signal timeframe is used only for simple "regime strength" gating (ADX + ATR%).
     """
-
-    def __init__(self, cfg: AppConfig, log: AppLogger, get_params: t.Callable[[], StrategyParamsV3]):
+    def __init__(self, cfg: AppConfig, log: AppLogger):
         self.cfg = cfg
         self.log = log
-        self.get_params = get_params
 
-    def compute_regime(self, sig: CandleSeries) -> list[RegimeState]:
-        p = self.get_params().sanitize()
-        if len(sig.c) < max(60, p.adx_len * 3 + 10):
-            return [RegimeState(adx=0.0, atr_pct=0.0) for _ in sig.c]
+    def compute_regime(self, sig: CandleSeries, p: StrategyParamsV32) -> list[RegimeState]:
+        n = len(sig.c)
+        if n < max(120, p.adx_len * 3, p.atr_len * 3):
+            return [RegimeState(strength=0.0, adx=0.0, atr_pct=0.0) for _ in range(n)]
 
         a = atr(sig.h, sig.l, sig.c, p.atr_len)
         adxv = adx(sig.h, sig.l, sig.c, p.adx_len)
 
         out: list[RegimeState] = []
-        for i in range(len(sig.c)):
+        for i in range(n):
             price = sig.c[i]
             atr_pct = (a[i] / max(1e-12, price)) if price > 0 else 0.0
-            out.append(RegimeState(adx=float(adxv[i]), atr_pct=float(atr_pct)))
+            # Strength: prefers healthy but not extreme volatility + decent ADX
+            adx_score = clamp((adxv[i] - 10.0) / 25.0, 0.0, 1.0)     # 10..35
+            vol_score = 1.0 - clamp(abs(atr_pct - 0.010) / 0.020, 0.0, 1.0)  # sweet spot around 1%
+            strength = clamp(0.65 * adx_score + 0.35 * vol_score, 0.0, 1.0)
+            out.append(RegimeState(strength=strength, adx=adxv[i], atr_pct=atr_pct))
         return out
 
-    def _zscore(self, series: list[float], lookback: int) -> float:
-        if len(series) < max(lookback, 20):
-            return 0.0
-        # z-score of log price: (logP - mean(logP))/std(logP)
-        window = series[-lookback:]
-        logw = [math.log(max(1e-12, x)) for x in window]
-        m = sum(logw) / lookback
-        v = sum((x - m) ** 2 for x in logw) / lookback
-        sd = math.sqrt(max(1e-12, v))
-        z = (logw[-1] - m) / sd
-        return float(z)
-
-    def _bollinger(self, series: list[float], length: int, mult: float) -> tuple[float, float, float]:
-        if len(series) < max(length, 20):
-            x = series[-1] if series else 0.0
-            return x, x, x
-        w = series[-length:]
-        m = sum(w) / length
-        v = sum((x - m) ** 2 for x in w) / length
-        sd = math.sqrt(max(1e-12, v))
-        upper = m + mult * sd
-        lower = m - mult * sd
-        return float(lower), float(m), float(upper)
-
-    def choose_leverage(self, confidence: float, equity_dd: float) -> float:
-        """
-        Conservative leverage for mean-reversion:
-        - Base leverage is typically 1x.
-        - Add up to (lev_max-lev_base) scaled by confidence (and dampened in drawdown).
-        - Hard-capped by cfg.leverage_max and params.lev_max.
-        """
-        p = self.get_params().sanitize()
-
+    def choose_leverage(self, regime: RegimeState, equity_dd: float, p: StrategyParamsV32) -> float:
         if not self.cfg.leverage_enabled_paper:
             return 1.0
-
-        # Confidence scaling (0..1)
-        conf_scale = clamp((confidence - p.confidence_min) / max(1e-12, (0.95 - p.confidence_min)), 0.0, 1.0)
-        lev = p.lev_base + (p.lev_max - p.lev_base) * (conf_scale * p.lev_scale_by_signal)
-
-        # Drawdown dampener
+        # Conservative: lev_base + scaled strength, reduced in drawdown
+        lev = p.lev_base + (p.lev_scale_by_signal * regime.strength)
         if equity_dd > 0.02:
-            lev *= clamp(1.0 - equity_dd * 7.0, 0.35, 1.0)
-
-        lev = clamp(lev, self.cfg.leverage_min, min(self.cfg.leverage_max, p.lev_max))
+            lev *= clamp(1.0 - equity_dd * 6.0, 0.35, 1.0)
+        lev = clamp(lev, 1.0, min(self.cfg.leverage_max, p.lev_max))
         return float(lev)
 
     def entry_signal(
         self,
         pair: str,
         entry: CandleSeries,
-        idx_entry: int,
-        sig: CandleSeries,
-        idx_sig: int,
+        i: int,
         regime: RegimeState,
         equity_dd: float,
+        p: StrategyParamsV32
     ) -> EntrySignal:
-        p = self.get_params().sanitize()
+        """
+        Entry rules (continuation):
+        - Prior z is neutral (compression)
+        - BB width indicates squeeze (current bw < median bw * mult)
+        - ATR% expands above its median (expansion)
+        - Breakout: z crosses above z_reentry, close > vwap, close > bb_mid
+        - Momentum: close > close[-k], RSI above threshold, ADX within [min, max]
+        """
+        if i < max(p.z_lookback, p.bb_len, p.vwap_lookback, p.squeeze_bw_lookback, 80):
+            return EntrySignal("HOLD", 0.0, "Insufficient history", 1.0, 0.0, 0.0, {})
 
-        # Need enough entry history
-        if idx_entry < max(p.z_lookback, p.bb_len, p.rsi_len, p.atr_len) + 5:
-            return EntrySignal("HOLD", 0.0, "Insufficient entry history", 1.0, 0.0, 0.0, {"need": "more_candles"})
-
-        price = entry.c[idx_entry]
+        close = entry.c[:i + 1]
+        high = entry.h[:i + 1]
+        low = entry.l[:i + 1]
+        vol = entry.v[:i + 1]
+        price = close[-1]
         if price <= 0:
             return EntrySignal("HOLD", 0.0, "Bad price", 1.0, 0.0, 0.0, {})
 
-        # Regime filter: avoid strong trends (ADX high)
-        if regime.adx > p.adx_max_for_mr:
-            return EntrySignal("HOLD", 0.0, "ADX too high (trend risk)", 1.0, 0.0, 0.0, {"adx": regime.adx})
+        # Compute indicators
+        z = zscore(close, p.z_lookback)
+        z_now = z[-1]
+        z_prev = z[-2] if len(z) >= 2 else 0.0
 
-        # Volatility sanity (using entry TF ATR%)
-        close = entry.c[:idx_entry + 1]
-        high = entry.h[:idx_entry + 1]
-        low = entry.l[:idx_entry + 1]
+        mid, upper, lower = bollinger(close, p.bb_len, p.bb_mult)
+        bb_mid = mid[-1]
+        bb_u = upper[-1]
+        bb_l = lower[-1]
+        bb_width = (bb_u - bb_l) / max(1e-12, bb_mid)
+
+        # Squeeze: compare to rolling median of bb width
+        bw_series: list[float] = []
+        for j in range(len(close)):
+            if j < p.bb_len:
+                bw_series.append(0.0)
+            else:
+                m, u, l = bollinger(close[:j + 1], p.bb_len, p.bb_mult)
+                bw = (u[-1] - l[-1]) / max(1e-12, m[-1])
+                bw_series.append(bw)
+
+        bw_med = rolling_median(bw_series, p.squeeze_bw_lookback)[-1]
+        is_squeeze = (bw_med > 0) and (bb_width < (bw_med * p.squeeze_bw_mult))
 
         a = atr(high, low, close, p.atr_len)
-        atr_now = a[-1] if a else 0.0
-        atr_pct = atr_now / max(1e-12, price)
+        atr_now = a[-1]
+        atr_pct_now = atr_now / max(1e-12, price)
+        atr_pct_series = [(a_k / max(1e-12, c_k)) if c_k > 0 else 0.0 for a_k, c_k in zip(a, close)]
+        atr_pct_med = rolling_median(atr_pct_series, p.squeeze_bw_lookback)[-1]
+        is_expansion = (atr_pct_med > 0) and (atr_pct_now > atr_pct_med * p.atr_expand_mult)
 
-        if atr_pct < p.atr_min_pct:
-            return EntrySignal("HOLD", 0.0, "ATR% too low (chop risk)", 1.0, 0.0, 0.0, {"atr_pct": atr_pct})
-        if atr_pct > p.atr_max_pct:
-            return EntrySignal("HOLD", 0.0, "ATR% too high (spike risk)", 1.0, 0.0, 0.0, {"atr_pct": atr_pct})
+        vwap = rolling_vwap(close, vol, p.vwap_lookback)
+        vwap_now = vwap[-1]
 
-        # RSI guard
-        r = rsi(close, p.rsi_len)
-        rsi_now = r[-1] if r else 50.0
-        if rsi_now > p.rsi_oversold:
-            return EntrySignal("HOLD", 0.0, "RSI not oversold", 1.0, 0.0, 0.0, {"rsi": rsi_now})
+        rs = rsi(close, p.rsi_len)
+        rsi_now = rs[-1]
 
-        # Z-score (mean-reversion trigger)
-        z = self._zscore(close, p.z_lookback)
-        if z > -p.z_enter:
-            return EntrySignal("HOLD", 0.0, "Z-score not extreme enough", 1.0, 0.0, 0.0, {"z": z})
+        adxv = adx(high, low, close, p.adx_len)
+        adx_now = adxv[-1]
+        adx_prev = adxv[-2] if len(adxv) >= 2 else adx_now
+        adx_rising = adx_now >= adx_prev
 
-        # Bollinger confirmation (optional but helpful on MR)
-        lower, mid, upper = self._bollinger(close, p.bb_len, p.bb_mult)
-        if lower > 0:
-            # require price to be near/below lower band
-            if price > lower * (1.0 + p.bb_enter_pct):
-                return EntrySignal(
-                    "HOLD", 0.0,
-                    "Not near lower band",
-                    1.0, 0.0, 0.0,
-                    {"price": price, "bb_lower": lower, "bb_enter_pct": p.bb_enter_pct}
-                )
+        # Basic sanity bands
+        if atr_pct_now < p.atr_min_pct:
+            return EntrySignal("HOLD", 0.0, "ATR% too low", 1.0, 0.0, 0.0, {"atr_pct": atr_pct_now})
+        if atr_pct_now > p.atr_max_pct:
+            return EntrySignal("HOLD", 0.0, "ATR% too high", 1.0, 0.0, 0.0, {"atr_pct": atr_pct_now})
 
-        # Stop distance using ATR
-        stop_dist = p.atr_stop_mult * atr_now
+        # Regime gating from signal timeframe
+        if not (p.adx_min_rising <= adx_now <= p.adx_max_entry):
+            return EntrySignal("HOLD", 0.0, "ADX out of entry band", 1.0, 0.0, 0.0, {"adx": adx_now})
+        if not adx_rising:
+            return EntrySignal("HOLD", 0.0, "ADX not rising", 1.0, 0.0, 0.0, {"adx": adx_now})
+
+        # Compression prerequisites
+        if not is_squeeze:
+            return EntrySignal("HOLD", 0.0, "No squeeze", 1.0, 0.0, 0.0, {"bb_width": bb_width, "bw_med": bw_med})
+
+        # Require that we were recently neutral (avoid chasing late trends)
+        if abs(z_prev) > p.z_neutral_band:
+            return EntrySignal("HOLD", 0.0, "Prior z not neutral", 1.0, 0.0, 0.0, {"z_prev": z_prev})
+
+        # Expansion trigger
+        if not is_expansion:
+            return EntrySignal("HOLD", 0.0, "No vol expansion", 1.0, 0.0, 0.0, {"atr_pct": atr_pct_now, "atr_med": atr_pct_med})
+
+        # Directional breakout confirmation
+        crossed = (z_prev <= p.z_reentry and z_now > p.z_reentry)
+        if not crossed:
+            return EntrySignal("HOLD", 0.0, "No z breakout cross", 1.0, 0.0, 0.0, {"z_now": z_now, "z_prev": z_prev})
+
+        if not (price > vwap_now and price > bb_mid):
+            return EntrySignal("HOLD", 0.0, "Price not above VWAP/BB mid", 1.0, 0.0, 0.0, {"price": price, "vwap": vwap_now, "bb_mid": bb_mid})
+
+        # Momentum confirm
+        k = max(1, p.momentum_confirm_bars)
+        if i - k < 0:
+            return EntrySignal("HOLD", 0.0, "Momentum window short", 1.0, 0.0, 0.0, {})
+        if not (price > close[-1 - k]):
+            return EntrySignal("HOLD", 0.0, "No momentum confirm", 1.0, 0.0, 0.0, {"k": k})
+
+        if rsi_now < p.rsi_min_for_long:
+            return EntrySignal("HOLD", 0.0, "RSI too weak", 1.0, 0.0, 0.0, {"rsi": rsi_now})
+        if rsi_now > p.rsi_overheat:
+            return EntrySignal("HOLD", 0.0, "RSI overheated", 1.0, 0.0, 0.0, {"rsi": rsi_now})
+
+        # Define stop using ATR (continuation: tighter stop, but not too tight)
+        stop_dist = max(1e-9, p.atr_stop_mult * atr_now)
         stop_price = price - stop_dist
         if stop_price <= 0:
             return EntrySignal("HOLD", 0.0, "Invalid stop price", 1.0, 0.0, 0.0, {"atr": atr_now})
 
-        r_value = price - stop_price  # 1R in price terms
+        r_value = price - stop_price
 
-        # Fee-aware minimum R gate
+        # Cost gate (round trip)
         bps_total = (self.cfg.backtest_fee_bps + self.cfg.backtest_slippage_bps) / 10000.0
-        est_round_trip_cost = price * bps_total * 2.2  # padded
+        est_round_trip_cost = price * bps_total * 2.2
         if r_value < est_round_trip_cost * p.min_r_vs_cost_mult:
-            return EntrySignal(
-                "HOLD", 0.0,
-                "R too small vs estimated costs",
-                1.0, 0.0, 0.0,
-                {"r_value": r_value, "est_cost": est_round_trip_cost, "price": price}
-            )
+            return EntrySignal("HOLD", 0.0, "R too small vs costs", 1.0, 0.0, 0.0,
+                               {"r_value": r_value, "est_cost": est_round_trip_cost})
 
-        # Confidence model:
-        # - deeper z => higher confidence
-        # - lower RSI => higher confidence
-        # - lower ADX => higher confidence
-        z_depth = clamp((-z - p.z_enter) / max(1e-12, (p.z_enter * 1.2)), 0.0, 1.0)
-        rsi_score = clamp((p.rsi_oversold - rsi_now) / max(1e-12, p.rsi_oversold), 0.0, 1.0)
-        adx_score = clamp((p.adx_max_for_mr - regime.adx) / max(1e-12, p.adx_max_for_mr), 0.0, 1.0)
+        # Confidence score (balanced)
+        squeeze_score = clamp(1.0 - (bb_width / (bw_med + 1e-12)), 0.0, 1.0) if bw_med > 0 else 0.0
+        z_score = clamp((z_now - p.z_reentry) / max(1e-9, (2.5 - p.z_reentry)), 0.0, 1.0)
+        adx_score = clamp((adx_now - p.adx_min_rising) / max(1e-9, (p.adx_max_entry - p.adx_min_rising)), 0.0, 1.0)
+        rsi_score = clamp((rsi_now - p.rsi_min_for_long) / max(1e-9, (p.rsi_overheat - p.rsi_min_for_long)), 0.0, 1.0)
 
-        conf = clamp(0.45 + 0.30 * z_depth + 0.20 * rsi_score + 0.15 * adx_score, 0.0, 0.95)
+        conf = clamp(0.20 + 0.35 * squeeze_score + 0.25 * z_score + 0.20 * adx_score + 0.10 * rsi_score, 0.0, 0.95)
 
-        lev = self.choose_leverage(conf, equity_dd)
+        lev = self.choose_leverage(regime, equity_dd, p)
 
         return EntrySignal(
             action="BUY",
             confidence=float(conf),
-            reason="Mean-reversion (z-score + RSI + low ADX)",
+            reason="Squeeze->Expansion breakout (continuation)",
             leverage=float(lev),
             stop_price=float(stop_price),
             r_value=float(r_value),
             meta={
-                "pair": pair,
                 "price": price,
-                "z": z,
-                "rsi": rsi_now,
+                "z_prev": z_prev,
+                "z_now": z_now,
+                "bb_mid": bb_mid,
+                "bb_width": bb_width,
+                "bw_med": bw_med,
                 "atr": atr_now,
-                "atr_pct": atr_pct,
-                "bb_lower": lower,
-                "bb_mid": mid,
-                "bb_upper": upper,
-                "regime_adx": regime.adx,
-                "regime_atr_pct": regime.atr_pct,
+                "atr_pct": atr_pct_now,
+                "atr_med": atr_pct_med,
+                "vwap": vwap_now,
+                "rsi": rsi_now,
+                "adx": adx_now,
                 "equity_dd": equity_dd,
-                "params": dataclasses.asdict(p),
+                "regime_strength": regime.strength,
             }
         )
 
 
 # =========================
-# Backtesting (v0.3 - StrategyV3)
+# Backtesting (v0.3.2)
 # =========================
 
 @dataclass
@@ -1296,24 +1317,27 @@ class SimPosition:
     leverage: float
     margin_used: float
     entry_ts_ms: int
+    entry_bar_index: int
 
+    # exit management
     took_partial: bool = False
     qty_remaining: float = 0.0
-    bars_held: int = 0
+    trail_stop: float = 0.0
+    last_exit_bar: int = -10_000
 
 
-class BacktesterV3:
+class BacktesterV32:
     """
     Long-only with paper leverage simulation.
-    - Position sized by risk_per_trade: risk amount equals max loss at stop.
-    - Leverage affects margin used; liquidation if loss exceeds margin_used*(1-maint_margin_ratio).
-    - Partial exit at +X R (params.take_partial_at_r); then managed exit on reversion or time stop.
+    - Position sized by cfg.risk_per_trade: max loss at stop equals risk amount
+    - Leverage affects margin used; liquidation if low breaches liquidation price
+    - Partial exit at +R; trailing stop thereafter
+    - Exit if z reverts toward 0 or time stop
     """
-    def __init__(self, cfg: AppConfig, log: AppLogger, strategy: StrategyV3, get_params: t.Callable[[], StrategyParamsV3]):
+    def __init__(self, cfg: AppConfig, log: AppLogger, strategy: StrategyV32):
         self.cfg = cfg
         self.log = log
         self.strategy = strategy
-        self.get_params = get_params
 
     def _apply_slippage(self, price: float, side: str) -> float:
         slip = self.cfg.backtest_slippage_bps / 10000.0
@@ -1327,13 +1351,13 @@ class BacktesterV3:
     def _liquidation_price_long(self, pos: SimPosition) -> float:
         """
         Simplified liquidation:
-        - Liquidation occurs when equity in position <= maintenance margin.
-        - loss_at_liq = margin_used * (1 - maint_margin_ratio)
+        - loss_cap = margin_used * (1 - maint_margin_ratio)
+        - liq_price = entry_price - loss_cap/qty
         """
         loss_cap = pos.margin_used * (1.0 - self.cfg.maint_margin_ratio)
-        if pos.qty <= 0 or pos.entry_price <= 0:
+        if pos.qty_remaining <= 0 or pos.entry_price <= 0:
             return 0.0
-        return max(0.0, pos.entry_price - (loss_cap / pos.qty))
+        return max(0.0, pos.entry_price - (loss_cap / pos.qty_remaining))
 
     def run(
         self,
@@ -1341,11 +1365,12 @@ class BacktesterV3:
         entry: CandleSeries,
         signal: CandleSeries,
         regime_series: list[RegimeState],
+        params: StrategyParamsV32,
         initial_equity: float = 100.0
     ) -> BacktestResult:
-        p = self.get_params().sanitize()
+        p = params.sanitize()
 
-        if len(entry.c) < 400 or len(signal.c) < 260 or len(regime_series) != len(signal.c):
+        if len(entry.c) < 600 or len(signal.c) < 200 or len(regime_series) != len(signal.c):
             return BacktestResult(
                 pair=pair, entry_tf=entry.tf, signal_tf=signal.tf,
                 start_ms=0, end_ms=0,
@@ -1361,7 +1386,7 @@ class BacktesterV3:
 
         pos: SimPosition | None = None
 
-        trades = 0
+        closed_trades = 0
         wins = 0
         trade_returns: list[float] = []
         gross_profit = 0.0
@@ -1369,11 +1394,15 @@ class BacktesterV3:
 
         eq_curve: list[tuple[int, float]] = []
 
+        # Precompute z for exit condition (efficient)
+        z_series = zscore(entry.c, p.z_lookback)
+        atr_series = atr(entry.h, entry.l, entry.c, p.atr_len)
+
         def equity_drawdown() -> float:
             return (peak - equity) / max(1e-12, peak)
 
-        # Pre-compute z / bb mid to allow exit logic without recomputing too heavy
-        # (still O(n*lookback) if naive; we keep it lightweight for v0.3.1)
+        last_exit_bar = -10_000
+
         for i in range(0, len(entry.ts)):
             ts = entry.ts[i]
             idx_sig = find_last_index_leq(signal.ts, ts)
@@ -1387,55 +1416,56 @@ class BacktesterV3:
             if price <= 0:
                 continue
 
-            # Update open position
+            # --- Manage open position ---
             if pos is not None:
-                pos.bars_held += 1
-
-                # Liquidation check (intrabar)
+                # liquidation
                 liq_px = self._liquidation_price_long(pos)
                 if liq_px > 0 and lo <= liq_px:
                     exit_px = self._apply_slippage(liq_px, "SELL")
                     notional = pos.qty_remaining * exit_px
                     fee = self._fee(notional)
                     pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
-                    equity += pnl
 
-                    trades += 1
+                    equity += pnl
+                    closed_trades += 1
                     if pnl > 0:
                         wins += 1
                         gross_profit += pnl
                     else:
                         gross_loss += abs(pnl)
-                    trade_returns.append(pnl / max(1e-12, equity))
-
+                    trade_returns.append(pnl / max(1e-12, initial_equity))
                     pos = None
+                    last_exit_bar = i
                     eq_curve.append((ts, equity))
                     peak = max(peak, equity)
                     max_dd = max(max_dd, equity_drawdown())
                     break
 
-                # Hard stop
-                if lo <= pos.stop_price:
-                    exit_px = self._apply_slippage(pos.stop_price, "SELL")
+                # exit by stop / trailing stop
+                active_stop = max(pos.stop_price, pos.trail_stop)
+                if lo <= active_stop:
+                    exit_px = self._apply_slippage(active_stop, "SELL")
                     notional = pos.qty_remaining * exit_px
                     fee = self._fee(notional)
                     pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
-                    equity += pnl
 
-                    trades += 1
+                    equity += pnl
+                    closed_trades += 1
                     if pnl > 0:
                         wins += 1
                         gross_profit += pnl
                     else:
                         gross_loss += abs(pnl)
-                    trade_returns.append(pnl / max(1e-12, equity))
+                    trade_returns.append(pnl / max(1e-12, initial_equity))
                     pos = None
+                    last_exit_bar = i
                 else:
-                    # Partial at +X R
-                    tp_r = pos.entry_price + p.take_partial_at_r * pos.r_value
-                    if (not pos.took_partial) and hi >= tp_r and pos.qty_remaining > 0:
-                        take_qty = pos.qty_remaining * p.partial_qty_frac
-                        exit_px = self._apply_slippage(tp_r, "SELL")
+                    # partial at +R
+                    tp_r = max(0.10, p.take_partial_at_r)
+                    tp1 = pos.entry_price + tp_r * pos.r_value
+                    if (not pos.took_partial) and hi >= tp1:
+                        take_qty = pos.qty_remaining * clamp(p.partial_qty_frac, 0.05, 0.95)
+                        exit_px = self._apply_slippage(tp1, "SELL")
                         notional = take_qty * exit_px
                         fee = self._fee(notional)
                         pnl = (exit_px - pos.entry_price) * take_qty - fee
@@ -1444,85 +1474,76 @@ class BacktesterV3:
                         pos.qty_remaining = max(0.0, pos.qty_remaining - take_qty)
                         pos.took_partial = True
 
-                        # Reduce risk by tightening stop to entry (break-even) after partial
+                        # Stop to breakeven after partial
                         pos.stop_price = max(pos.stop_price, pos.entry_price)
 
-                    # Mean-reversion exit logic: z crosses toward mean OR BB mid-band (optional)
-                    # Compute on the fly using current history slice
-                    close_slice = entry.c[:i + 1]
-                    z = self.strategy._zscore(close_slice, p.z_lookback)
-                    bb_lower, bb_mid, bb_upper = self.strategy._bollinger(close_slice, p.bb_len, p.bb_mult)
+                    # trailing update once partial taken
+                    if pos is not None and pos.took_partial and pos.qty_remaining > 0:
+                        atr_now = atr_series[i] if i < len(atr_series) else 0.0
+                        if atr_now > 0:
+                            new_trail = price - p.trail_atr_mult * atr_now
+                            pos.trail_stop = max(pos.trail_stop, new_trail)
 
-                    exit_reason = ""
-                    should_exit = False
-
-                    # Z-based reversion exit
-                    if z >= -p.z_exit:
-                        should_exit = True
-                        exit_reason = "Z reversion"
-
-                    # Optional BB mid exit
-                    if (not should_exit) and p.bb_exit_mid and bb_mid > 0 and price >= bb_mid:
-                        should_exit = True
-                        exit_reason = "BB mid exit"
-
-                    # Time stop
-                    if (not should_exit) and pos.bars_held >= p.max_bars_hold:
-                        should_exit = True
-                        exit_reason = "Time stop"
-
-                    # If regime becomes too trending mid-trade (ADX rises), exit to reduce MR failure cases
-                    if (not should_exit) and regime.adx > (p.adx_max_for_mr + 6.0):
-                        should_exit = True
-                        exit_reason = "ADX trend risk"
-
-                    if should_exit and pos is not None and pos.qty_remaining > 0:
+                    # exit on z reversion (mean reversion used for exit)
+                    z_now = z_series[i] if i < len(z_series) else 0.0
+                    if pos is not None and abs(z_now) <= p.z_exit_revert and pos.qty_remaining > 0 and (i - pos.entry_bar_index) >= 3:
                         exit_px = self._apply_slippage(price, "SELL")
                         notional = pos.qty_remaining * exit_px
                         fee = self._fee(notional)
                         pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
-                        equity += pnl
 
-                        trades += 1
+                        equity += pnl
+                        closed_trades += 1
                         if pnl > 0:
                             wins += 1
                             gross_profit += pnl
                         else:
                             gross_loss += abs(pnl)
-                        trade_returns.append(pnl / max(1e-12, equity))
+                        trade_returns.append(pnl / max(1e-12, initial_equity))
                         pos = None
+                        last_exit_bar = i
 
-            # Entry logic if flat
+                    # time stop
+                    if pos is not None and (i - pos.entry_bar_index) >= p.max_bars_hold:
+                        exit_px = self._apply_slippage(price, "SELL")
+                        notional = pos.qty_remaining * exit_px
+                        fee = self._fee(notional)
+                        pnl = (exit_px - pos.entry_price) * pos.qty_remaining - fee
+
+                        equity += pnl
+                        closed_trades += 1
+                        if pnl > 0:
+                            wins += 1
+                            gross_profit += pnl
+                        else:
+                            gross_loss += abs(pnl)
+                        trade_returns.append(pnl / max(1e-12, initial_equity))
+                        pos = None
+                        last_exit_bar = i
+
+            # --- Entry if flat ---
             if pos is None:
-                if equity_drawdown() >= 0.25:
+                # cooldown after exit
+                if (i - last_exit_bar) < p.cooldown_bars_after_exit:
+                    eq_curve.append((ts, equity))
+                    peak = max(peak, equity)
+                    max_dd = max(max_dd, equity_drawdown())
+                    continue
+
+                # hard backtest “damage” cap (avoid unrealistic recovery)
+                if equity_drawdown() >= 0.35:
                     eq_curve.append((ts, equity))
                     break
 
-                idx_sig = find_last_index_leq(signal.ts, ts)
-                if idx_sig < 0:
-                    eq_curve.append((ts, equity))
-                    continue
-                regime = regime_series[idx_sig]
-
-                es = self.strategy.entry_signal(
-                    pair=pair,
-                    entry=entry,
-                    idx_entry=i,
-                    sig=signal,
-                    idx_sig=idx_sig,
-                    regime=regime,
-                    equity_dd=equity_drawdown(),
-                )
-
+                es = self.strategy.entry_signal(pair, entry, i, regime, equity_drawdown(), p)
                 if es.action == "BUY" and es.confidence >= p.confidence_min:
+                    # Size by risk
                     risk_amount = equity * clamp(self.cfg.risk_per_trade, 0.0005, 0.05)
-                    stop_dist = max(1e-9, (entry.c[i] - es.stop_price))
+                    stop_dist = max(1e-9, (price - es.stop_price))
                     qty = risk_amount / stop_dist
 
-                    lev = es.leverage if self.cfg.leverage_enabled_paper else 1.0
-                    lev = clamp(lev, self.cfg.leverage_min, self.cfg.leverage_max)
-
-                    entry_px = self._apply_slippage(entry.c[i], "BUY")
+                    lev = clamp(es.leverage, 1.0, self.cfg.leverage_max)
+                    entry_px = self._apply_slippage(price, "BUY")
                     notional = qty * entry_px
                     if notional <= 0:
                         eq_curve.append((ts, equity))
@@ -1530,7 +1551,6 @@ class BacktesterV3:
 
                     margin_required = notional / lev
                     margin_cap = equity * self.cfg.margin_alloc_cap
-
                     if margin_required > margin_cap:
                         scale = margin_cap / max(1e-12, margin_required)
                         qty *= scale
@@ -1553,9 +1573,10 @@ class BacktesterV3:
                         leverage=lev,
                         margin_used=margin_required,
                         entry_ts_ms=ts,
+                        entry_bar_index=i,
                         took_partial=False,
                         qty_remaining=qty,
-                        bars_held=0,
+                        trail_stop=0.0,
                     )
 
             eq_curve.append((ts, equity))
@@ -1563,15 +1584,15 @@ class BacktesterV3:
             max_dd = max(max_dd, equity_drawdown())
 
         total_return = (equity - initial_equity) / max(1e-12, initial_equity)
-        win_rate = wins / trades if trades > 0 else 0.0
+        win_rate = (wins / closed_trades) if closed_trades > 0 else 0.0
         profit_factor = (gross_profit / max(1e-12, gross_loss)) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
-        avg_tr = sum(trade_returns) / len(trade_returns) if trade_returns else 0.0
+        avg_tr = (sum(trade_returns) / len(trade_returns)) if trade_returns else 0.0
 
         start_ms = entry.ts[0] if entry.ts else 0
         end_ms = entry.ts[-1] if entry.ts else 0
 
         notes = "OK"
-        if trades < 10:
+        if closed_trades < 12:
             notes = "Low trades"
         if total_return < 0:
             notes = "Negative"
@@ -1582,7 +1603,7 @@ class BacktesterV3:
             signal_tf=signal.tf,
             start_ms=start_ms,
             end_ms=end_ms,
-            trades=trades,
+            trades=closed_trades,
             win_rate=win_rate,
             total_return=total_return,
             max_drawdown=max_dd,
@@ -1595,7 +1616,7 @@ class BacktesterV3:
                 "leverage_cap": self.cfg.leverage_max,
                 "margin_alloc_cap": self.cfg.margin_alloc_cap,
                 "maint_margin_ratio": self.cfg.maint_margin_ratio,
-                "strategy_params": dataclasses.asdict(self.get_params().sanitize()),
+                "strategy_params": dataclasses.asdict(p),
             }
         )
 
@@ -1605,11 +1626,12 @@ class BacktesterV3:
         entry: CandleSeries,
         signal: CandleSeries,
         regime_series: list[RegimeState],
+        params: StrategyParamsV32,
         initial_equity: float = 100.0
     ) -> BacktestResult:
         n = len(entry.ts)
-        if n < 800:
-            return self.run(pair, entry, signal, regime_series, initial_equity)
+        if n < 1200:
+            return self.run(pair, entry, signal, regime_series, params, initial_equity)
 
         segments = 5
         seg_size = n // segments
@@ -1632,7 +1654,7 @@ class BacktesterV3:
                 ts=entry.ts[a:b], o=entry.o[a:b], h=entry.h[a:b], l=entry.l[a:b], c=entry.c[a:b], v=entry.v[a:b],
             )
 
-            res = self.run(pair, e_seg, signal, regime_series, eq)
+            res = self.run(pair, e_seg, signal, regime_series, params, eq)
             eq = eq * (1.0 + res.total_return)
 
             total_trades += res.trades
@@ -1670,7 +1692,7 @@ class BacktesterV3:
                 "paper_leverage_enabled": self.cfg.leverage_enabled_paper,
                 "leverage_cap": self.cfg.leverage_max,
                 "segments": segments,
-                "strategy_params": dataclasses.asdict(self.get_params().sanitize()),
+                "strategy_params": dataclasses.asdict(params.sanitize()),
             }
         )
 
@@ -1692,7 +1714,6 @@ class ReportWriter:
         json_path = self.reports_dir / f"backtest_{stamp}.json"
         txt_path = self.reports_dir / f"backtest_{stamp}_summary.txt"
 
-        # CSV summary
         try:
             header = "pair,entry_tf,signal_tf,start_utc,end_utc,trades,win_rate,total_return,max_drawdown,profit_factor,avg_trade_return,notes\n"
             lines = [header]
@@ -1707,7 +1728,6 @@ class ReportWriter:
         except Exception as e:
             self.log.exception("Failed writing CSV report", e)
 
-        # JSON full
         try:
             payload = {
                 "generated_utc": now_utc().strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -1718,25 +1738,20 @@ class ReportWriter:
         except Exception as e:
             self.log.exception("Failed writing JSON report", e)
 
-        # TXT compact
         try:
             top_lines = []
             top_lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
             top_lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
             for k, v in context.items():
-                if k == "strategy_params":
+                if k == "strategy_params_json":
                     continue
                 top_lines.append(f"{k}: {v}")
-            top_lines.append("")
-            if "strategy_params" in context:
-                top_lines.append("Strategy Params (v3):")
-                try:
-                    params_pretty = json.dumps(context["strategy_params"], ensure_ascii=False, indent=2)
-                    for line in params_pretty.splitlines():
-                        top_lines.append("  " + line)
-                except Exception:
-                    top_lines.append("  (unavailable)")
+            spj = context.get("strategy_params_json", "")
+            if spj:
                 top_lines.append("")
+                top_lines.append("Strategy Params (v0.3.2):")
+                top_lines.append(spj)
+            top_lines.append("")
             top_lines.append("Top Results:")
             for r in results[:10]:
                 top_lines.append(" - " + r.summary_line())
@@ -1750,7 +1765,7 @@ class ReportWriter:
 
 
 # =========================
-# Paper Portfolio (for GUI engine loop)
+# Paper Portfolio (GUI engine loop)
 # =========================
 
 @dataclass
@@ -1781,6 +1796,9 @@ class TradingEngine:
         self.storage = storage
         self.notifier = notifier
 
+        self.strategy = StrategyV32(cfg, log)
+        self.backtester = BacktesterV32(cfg, log, self.strategy)
+
         self._lock = threading.Lock()
         self._running = False
         self._thread: threading.Thread | None = None
@@ -1793,55 +1811,30 @@ class TradingEngine:
 
         self.paper = PaperPortfolio(equity=100.0, cash=100.0)
 
-        # Strategy params are GUI-controlled and persisted
-        self._params_lock = threading.Lock()
-        self._strategy_params: StrategyParamsV3 = self._load_or_init_strategy_params()
+        # Strategy params persisted in DB (GUI writes here)
+        self.params = self._load_or_init_params()
 
-        # Strategy and backtester use a params provider (so GUI apply updates instantly)
-        self.strategy_v3 = StrategyV3(cfg, log, get_params=self.get_strategy_params)
-        self.backtester_v3 = BacktesterV3(cfg, log, self.strategy_v3, get_params=self.get_strategy_params)
-
-    # ---- Strategy params persistence ----
-
-    def _load_or_init_strategy_params(self) -> StrategyParamsV3:
-        try:
-            raw = self.storage.kv_get(STRATEGY_PARAMS_KEY, "")
-            if raw.strip():
-                p = StrategyParamsV3.from_json(raw).sanitize()
-                self.log.info("Loaded strategy params from SQLite.")
-                return p
-        except Exception as e:
-            self.log.warn(f"Failed loading strategy params: {e}")
-
-        p = StrategyParamsV3().sanitize()
-        try:
-            self.storage.kv_set(STRATEGY_PARAMS_KEY, p.to_json())
-            self.log.info("Initialized default strategy params into SQLite.")
-        except Exception:
-            pass
+    def _load_or_init_params(self) -> StrategyParamsV32:
+        raw = self.storage.get_gate(GATE_STRAT_PARAMS_JSON, "")
+        if raw.strip():
+            p = StrategyParamsV32.from_json(raw).sanitize()
+            self.log.info("Loaded strategy params from DB.")
+            return p
+        p = StrategyParamsV32().sanitize()
+        self.storage.set_gate(GATE_STRAT_PARAMS_JSON, p.to_json())
+        self.log.info("Initialized default strategy params in DB.")
         return p
 
-    def get_strategy_params(self) -> StrategyParamsV3:
-        with self._params_lock:
-            return dataclasses.replace(self._strategy_params).sanitize()
-
-    def set_strategy_params(self, new_params: StrategyParamsV3, persist: bool = True) -> StrategyParamsV3:
-        p = new_params.sanitize()
-        with self._params_lock:
-            self._strategy_params = p
-        if persist:
-            try:
-                self.storage.kv_set(STRATEGY_PARAMS_KEY, p.to_json())
-            except Exception as e:
-                self.log.warn(f"Persist strategy params failed: {e}")
-        self.log.info("Strategy params updated (GUI).")
+    def save_params(self, params: StrategyParamsV32) -> StrategyParamsV32:
+        p = params.sanitize()
+        self.params = p
+        self.storage.set_gate(GATE_STRAT_PARAMS_JSON, p.to_json())
+        self.log.info("Saved strategy params to DB.")
         return p
-
-    # ---- Live safety gates ----
 
     def live_unlocked(self) -> bool:
         unlock_file = self.cfg.data_dir / LIVE_MODE_UNLOCK_FILE
-        gate = self.storage.get_gate("LIVE_GATE", "0")
+        gate = self.storage.get_gate(GATE_LIVE_GATE, "0")
         try:
             return unlock_file.exists() and gate == "1"
         except Exception:
@@ -1855,8 +1848,6 @@ class TradingEngine:
         if is_kill_switch_on(self.cfg.data_dir):
             return False
         return True
-
-    # ---- Pairs / candles ----
 
     def get_scan_pairs(self) -> list[str]:
         raw = (self.cfg.scan_pairs_csv or "").strip()
@@ -1885,7 +1876,7 @@ class TradingEngine:
     def ingest_candles(self, pair: str, duration_sec: int, start_ms: int, end_ms: int) -> int:
         total = 0
         since = start_ms
-        for _ in range(1000):
+        for _ in range(1200):
             if since >= end_ms:
                 break
             data = self._client_ro.candles(pair=pair, since_ms=since, duration_sec=duration_sec)
@@ -1909,8 +1900,6 @@ class TradingEngine:
         rows = self.storage.fetch_candles(pair, duration, start_ms, end_ms)
         return build_series_from_rows(pair, tf, duration, rows)
 
-    # ---- Backtest ----
-
     def run_backtest(self, pairs: list[str], entry_tf: str, days: int, initial_equity: float, walk_forward: bool) -> list[BacktestResult]:
         entry_duration = timeframe_to_seconds(entry_tf)
         signal_tf = self.cfg.signal_timeframe
@@ -1919,12 +1908,14 @@ class TradingEngine:
         end_ms = utc_ms()
         start_ms = end_ms - int(days * 86400 * 1000)
 
+        # snapshot params (thread-safe behavior for GUI edits mid-run)
+        p = self.params.sanitize()
+
         results: list[BacktestResult] = []
         for pair in pairs:
             pair = pair.upper().strip()
             if not pair:
                 continue
-
             try:
                 self.log.info(f"Backtest ingest candles: {pair} entry={entry_tf} signal={signal_tf} days={days}")
                 n1 = self.ingest_candles(pair, entry_duration, start_ms, end_ms)
@@ -1934,22 +1925,18 @@ class TradingEngine:
                 entry_series = self.load_series(pair, entry_tf, start_ms, end_ms)
                 signal_series = self.load_series(pair, signal_tf, start_ms, end_ms)
 
-                regimes = self.strategy_v3.compute_regime(signal_series)
+                regimes = self.strategy.compute_regime(signal_series, p)
 
                 if walk_forward:
-                    res = self.backtester_v3.walk_forward(pair, entry_series, signal_series, regimes, initial_equity=initial_equity)
+                    res = self.backtester.walk_forward(pair, entry_series, signal_series, regimes, p, initial_equity=initial_equity)
                 else:
-                    res = self.backtester_v3.run(pair, entry_series, signal_series, regimes, initial_equity=initial_equity)
-
+                    res = self.backtester.run(pair, entry_series, signal_series, regimes, p, initial_equity=initial_equity)
                 results.append(res)
-
             except Exception as e:
                 self.log.exception(f"Backtest failed for {pair}", e)
 
         results.sort(key=lambda r: r.total_return, reverse=True)
         return results
-
-    # ---- Engine loop (lightweight) ----
 
     def start(self) -> None:
         with self._lock:
@@ -1976,12 +1963,8 @@ class TradingEngine:
             self.paper.day_start_equity = self.paper.equity
             self.log.info(f"New UTC day: {day}. day_start_equity={self.paper.day_start_equity:.2f}")
 
-    def _paper_daily_pnl_pct(self) -> float:
-        return (self.paper.equity - self.paper.day_start_equity) / max(1e-12, self.paper.day_start_equity)
-
     def _run_loop(self) -> None:
         self._paper_reset_day_if_needed()
-
         while self.running():
             try:
                 if is_kill_switch_on(self.cfg.data_dir):
@@ -1996,8 +1979,8 @@ class TradingEngine:
 
                 if self.cfg.is_paper():
                     self._paper_reset_day_if_needed()
-                    # v0.3.1: keep paper engine conservative (no auto entries/exits yet).
-                    # Backtester remains the primary optimization tool.
+                    # v0.3.x keeps live/paper execution minimal. Backtest is the main optimizer.
+                    # (Future versions can promote backtest-validated logic into paper execution.)
                     pass
                 else:
                     self._last_health = "LIVE_LOCKED"
@@ -2020,7 +2003,7 @@ class Dashboard(tk.Tk):
     def __init__(self, repo_root: Path):
         super().__init__()
         self.title(f"{APP_NAME} {APP_VERSION}")
-        self.geometry("1280x820")
+        self.geometry("1320x820")
         self.minsize(1100, 720)
 
         self.repo_root = repo_root
@@ -2044,15 +2027,12 @@ class Dashboard(tk.Tk):
         self._last_backtest_context: dict[str, t.Any] = {}
         self._last_backtest_report_paths: dict[str, Path] = {}
 
-        # GUI-bound params
-        self._param_vars: dict[str, tk.StringVar] = {}
-
         self._build_style()
         self._build_widgets()
 
         self.after(250, self._poll_logs)
         self.after(500, self._refresh_status)
-        self.after(1000, self._drain_ui_queue)
+        self.after(500, self._drain_ui_queue)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._show_startup_notice()
@@ -2078,7 +2058,7 @@ class Dashboard(tk.Tk):
         ttk.Label(top, textvariable=self.var_mode, width=7).pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Label(top, text="Health:").pack(side=tk.LEFT)
-        ttk.Label(top, textvariable=self.var_health, width=26).pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(top, textvariable=self.var_health, width=28).pack(side=tk.LEFT, padx=(4, 12))
 
         ttk.Label(top, text="Equity:").pack(side=tk.LEFT)
         ttk.Label(top, textvariable=self.var_equity, width=16).pack(side=tk.LEFT, padx=(4, 12))
@@ -2099,6 +2079,7 @@ class Dashboard(tk.Tk):
         main.add(left, weight=3)
         main.add(right, weight=2)
 
+        # LEFT
         self.tbl_positions = self._make_table(
             left,
             title="Open Positions (Paper)",
@@ -2108,11 +2089,12 @@ class Dashboard(tk.Tk):
 
         self.tbl_rank = self._make_table(
             left,
-            title="Scanner / Latest Decisions",
-            columns=[("time", 160), ("pair", 90), ("action", 80), ("conf", 80), ("reason", 360)]
+            title="Latest Decisions (DB)",
+            columns=[("time", 170), ("pair", 90), ("action", 90), ("conf", 70), ("reason", 420)]
         )
         self.tbl_rank.pack(fill=tk.BOTH, expand=True)
 
+        # RIGHT
         controls = ttk.LabelFrame(right, text="Controls", padding=10)
         controls.pack(fill=tk.X, pady=(0, 8))
 
@@ -2129,38 +2111,24 @@ class Dashboard(tk.Tk):
 
         ttk.Separator(controls, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
 
-        # ---- Strategy Parameters (GUI-controlled) ----
-        params_box = ttk.LabelFrame(right, text="Strategy Parameters (Option A - Mean Reversion)", padding=10)
+        # Strategy params (GRID ONLY inside this frame)
+        params_box = ttk.LabelFrame(right, text="Strategy Parameters (v0.3.2) - GUI Controlled", padding=10)
         params_box.pack(fill=tk.X, pady=(0, 8))
 
         self._build_params_panel(params_box)
 
-        # Grid-compatible separator
+        # --- GRID separator (do not use pack here) ---
         sep = ttk.Separator(params_box, orient=tk.HORIZONTAL)
-        sep.grid(row=12, column=0, columnspan=2, sticky="ew", pady=10)
+        sep.grid(row=99, column=0, columnspan=4, sticky="ew", pady=10)
 
+        # Buttons in their own child frame using GRID
         btnp = ttk.Frame(params_box)
-        btnp.grid(row=13, column=0, columnspan=2, sticky="ew", pady=4)
+        btnp.grid(row=100, column=0, columnspan=4, sticky="ew")
+        ttk.Button(btnp, text="Apply & Save Params", command=self._apply_save_params).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        ttk.Button(btnp, text="Reload Saved Params", command=self._reload_params_from_engine).grid(row=0, column=1, padx=(0, 8), sticky="w")
+        ttk.Button(btnp, text="Reset to Defaults", command=self._reset_params_defaults).grid(row=0, column=2, sticky="w")
 
-        ttk.Button(
-            btnp,
-            text="Apply & Save Params",
-            command=self._apply_save_params
-        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
-
-        ttk.Button(
-            btnp,
-            text="Reload Saved Params",
-            command=self._reload_params_from_engine
-        ).grid(row=0, column=1, padx=(0, 8), sticky="w")
-
-        ttk.Button(
-            btnp,
-            text="Reset to Defaults",
-            command=self._reset_params_defaults
-        ).grid(row=0, column=2, sticky="w")
-
-        # ---- Backtest ----
+        # Backtest
         bt = ttk.LabelFrame(right, text="Backtest", padding=10)
         bt.pack(fill=tk.X, pady=(0, 8))
 
@@ -2208,9 +2176,6 @@ class Dashboard(tk.Tk):
         self.txt_logs = tk.Text(logs, height=12, wrap=tk.NONE)
         self.txt_logs.pack(fill=tk.BOTH, expand=True)
 
-        # Load GUI param fields from engine-saved params at startup
-        self._reload_params_from_engine()
-
     def _make_table(self, parent: tk.Widget, title: str, columns: list[tuple[str, int]]) -> ttk.Frame:
         frame = ttk.LabelFrame(parent, text=title, padding=6)
         cols = [c[0] for c in columns]
@@ -2231,154 +2196,120 @@ class Dashboard(tk.Tk):
     def _show_startup_notice(self) -> None:
         msg = (
             "PAPER mode is recommended while optimizing backtests.\n\n"
-            "This software includes risk controls and paper leverage simulation.\n"
+            "Strategy parameters are editable via GUI and persisted locally.\n"
             "Use read-only keys for data access and testing.\n"
         )
         messagebox.showinfo(f"{APP_NAME}", msg)
 
-    # ---- Strategy params panel ----
-
+    # ---------- Params panel ----------
     def _build_params_panel(self, parent: ttk.LabelFrame) -> None:
-        """
-        Creates GUI fields for StrategyParamsV3.
-        Fields are string vars, then sanitized and converted on Apply.
-        """
-        # We pack in a compact grid (label + entry), 2 columns of fields.
-        p = self.engine.get_strategy_params()
+        # Grid layout: 4 columns (label, entry) x 2
+        for col in range(4):
+            parent.grid_columnconfigure(col, weight=1 if col in (1, 3) else 0)
 
-        def add_field(row: int, col: int, key: str, label: str, default_val: t.Any) -> None:
-            if key not in self._param_vars:
-                self._param_vars[key] = tk.StringVar(value=str(default_val))
-            fr = ttk.Frame(parent)
-            fr.grid(row=row, column=col, sticky="ew", padx=4, pady=2)
-            fr.columnconfigure(1, weight=1)
-            ttk.Label(fr, text=label, width=18).grid(row=0, column=0, sticky="w")
-            ttk.Entry(fr, textvariable=self._param_vars[key], width=12).grid(row=0, column=1, sticky="ew")
+        p = self.engine.params.sanitize()
 
-        # Column 0 fields
-        add_field(0, 0, "z_lookback", "Z Lookback", p.z_lookback)
-        add_field(1, 0, "z_enter", "Z Enter", p.z_enter)
-        add_field(2, 0, "z_exit", "Z Exit", p.z_exit)
+        self._param_vars: dict[str, tk.StringVar] = {}
 
-        add_field(3, 0, "rsi_len", "RSI Len", p.rsi_len)
-        add_field(4, 0, "rsi_oversold", "RSI Oversold", p.rsi_oversold)
+        def add_row(row: int, key: str, label: str, value: t.Any, col_offset: int = 0) -> None:
+            ttk.Label(parent, text=label).grid(row=row, column=0 + col_offset, sticky="w", padx=(0, 8), pady=2)
+            var = tk.StringVar(value=str(value))
+            self._param_vars[key] = var
+            ttk.Entry(parent, textvariable=var, width=12).grid(row=row, column=1 + col_offset, sticky="ew", pady=2)
 
-        add_field(5, 0, "atr_len", "ATR Len", p.atr_len)
-        add_field(6, 0, "atr_min_pct", "ATR Min %", p.atr_min_pct)
-        add_field(7, 0, "atr_max_pct", "ATR Max %", p.atr_max_pct)
-        add_field(8, 0, "atr_stop_mult", "ATR Stop Mult", p.atr_stop_mult)
+        # Left block
+        r = 0
+        add_row(r, "z_lookback", "z_lookback", p.z_lookback, 0); add_row(r, "z_reentry", "z_reentry", p.z_reentry, 2); r += 1
+        add_row(r, "z_neutral_band", "z_neutral_band", p.z_neutral_band, 0); add_row(r, "z_exit_revert", "z_exit_revert", p.z_exit_revert, 2); r += 1
+        add_row(r, "vwap_lookback", "vwap_lookback", p.vwap_lookback, 0); add_row(r, "bb_len", "bb_len", p.bb_len, 2); r += 1
+        add_row(r, "bb_mult", "bb_mult", p.bb_mult, 0); add_row(r, "squeeze_bw_lookback", "squeeze_bw_lookback", p.squeeze_bw_lookback, 2); r += 1
+        add_row(r, "squeeze_bw_mult", "squeeze_bw_mult", p.squeeze_bw_mult, 0); add_row(r, "atr_len", "atr_len", p.atr_len, 2); r += 1
+        add_row(r, "atr_expand_mult", "atr_expand_mult", p.atr_expand_mult, 0); add_row(r, "atr_stop_mult", "atr_stop_mult", p.atr_stop_mult, 2); r += 1
+        add_row(r, "atr_min_pct", "atr_min_pct", p.atr_min_pct, 0); add_row(r, "atr_max_pct", "atr_max_pct", p.atr_max_pct, 2); r += 1
+        add_row(r, "rsi_len", "rsi_len", p.rsi_len, 0); add_row(r, "rsi_min_for_long", "rsi_min_for_long", p.rsi_min_for_long, 2); r += 1
+        add_row(r, "rsi_overheat", "rsi_overheat", p.rsi_overheat, 0); add_row(r, "adx_len", "adx_len", p.adx_len, 2); r += 1
+        add_row(r, "adx_min_rising", "adx_min_rising", p.adx_min_rising, 0); add_row(r, "adx_max_entry", "adx_max_entry", p.adx_max_entry, 2); r += 1
+        add_row(r, "momentum_confirm_bars", "momentum_confirm_bars", p.momentum_confirm_bars, 0); add_row(r, "cooldown_bars_after_exit", "cooldown_bars_after_exit", p.cooldown_bars_after_exit, 2); r += 1
+        add_row(r, "confidence_min", "confidence_min", p.confidence_min, 0); add_row(r, "max_bars_hold", "max_bars_hold", p.max_bars_hold, 2); r += 1
+        add_row(r, "take_partial_at_r", "take_partial_at_r", p.take_partial_at_r, 0); add_row(r, "partial_qty_frac", "partial_qty_frac", p.partial_qty_frac, 2); r += 1
+        add_row(r, "trail_atr_mult", "trail_atr_mult", p.trail_atr_mult, 0); add_row(r, "min_r_vs_cost_mult", "min_r_vs_cost_mult", p.min_r_vs_cost_mult, 2); r += 1
+        add_row(r, "lev_base", "lev_base", p.lev_base, 0); add_row(r, "lev_max", "lev_max", p.lev_max, 2); r += 1
+        add_row(r, "lev_scale_by_signal", "lev_scale_by_signal", p.lev_scale_by_signal, 0);  # last row left only
 
-        # Column 1 fields
-        add_field(0, 1, "bb_len", "BB Len", p.bb_len)
-        add_field(1, 1, "bb_mult", "BB Mult", p.bb_mult)
-        add_field(2, 1, "bb_enter_pct", "BB Enter %", p.bb_enter_pct)
+    def _vars_to_params(self) -> StrategyParamsV32:
+        # Parse with safe conversion
+        def gi(k: str, d: int) -> int:
+            return safe_int(self._param_vars.get(k, tk.StringVar(value=str(d))).get(), d)
 
-        add_field(3, 1, "adx_len", "ADX Len", p.adx_len)
-        add_field(4, 1, "adx_max_for_mr", "ADX Max MR", p.adx_max_for_mr)
+        def gf(k: str, d: float) -> float:
+            return safe_float(self._param_vars.get(k, tk.StringVar(value=str(d))).get(), d)
 
-        add_field(5, 1, "confidence_min", "Conf Min", p.confidence_min)
-        add_field(6, 1, "max_bars_hold", "Max Bars Hold", p.max_bars_hold)
-        add_field(7, 1, "take_partial_at_r", "Partial at R", p.take_partial_at_r)
-        add_field(8, 1, "partial_qty_frac", "Partial Qty", p.partial_qty_frac)
-
-        # Row 9 for leverage (compact)
-        add_field(9, 0, "lev_base", "Lev Base", p.lev_base)
-        add_field(9, 1, "lev_max", "Lev Max", p.lev_max)
-
-        # Row 10 for cost gate + scale
-        add_field(10, 0, "min_r_vs_cost_mult", "Min R vs Cost", p.min_r_vs_cost_mult)
-        add_field(10, 1, "lev_scale_by_signal", "Lev Scale", p.lev_scale_by_signal)
-
-        # Row 11: bb_exit_mid as dropdown boolean
-        fr = ttk.Frame(parent)
-        fr.grid(row=11, column=0, columnspan=2, sticky="ew", padx=4, pady=2)
-        fr.columnconfigure(1, weight=1)
-        ttk.Label(fr, text="BB Exit Mid", width=18).grid(row=0, column=0, sticky="w")
-        self._param_vars["bb_exit_mid"] = tk.StringVar(value="1" if p.bb_exit_mid else "0")
-        dd = ttk.Combobox(fr, textvariable=self._param_vars["bb_exit_mid"], width=10, values=["1", "0"], state="readonly")
-        dd.grid(row=0, column=1, sticky="w")
-        ttk.Label(fr, text="(1=yes, 0=no)").grid(row=0, column=2, sticky="w", padx=6)
-
-    def _params_from_gui(self) -> StrategyParamsV3:
-        """
-        Reads current GUI fields, builds StrategyParamsV3, sanitizes, returns it.
-        """
-        # Helper to read stringvar safely
-        def gv(k: str, default: str = "") -> str:
-            try:
-                return (self._param_vars.get(k) or tk.StringVar(value=default)).get().strip()
-            except Exception:
-                return default
-
-        p = StrategyParamsV3(
-            z_lookback=safe_int(gv("z_lookback", "120"), 120),
-            z_enter=safe_float(gv("z_enter", "1.75"), 1.75),
-            z_exit=safe_float(gv("z_exit", "0.35"), 0.35),
-
-            bb_len=safe_int(gv("bb_len", "120"), 120),
-            bb_mult=safe_float(gv("bb_mult", "2.0"), 2.0),
-            bb_enter_pct=safe_float(gv("bb_enter_pct", "0.02"), 0.02),
-            bb_exit_mid=(gv("bb_exit_mid", "1") not in ("0", "false", "False")),
-
-            rsi_len=safe_int(gv("rsi_len", "14"), 14),
-            rsi_oversold=safe_float(gv("rsi_oversold", "33.0"), 33.0),
-
-            atr_len=safe_int(gv("atr_len", "14"), 14),
-            atr_min_pct=safe_float(gv("atr_min_pct", "0.0012"), 0.0012),
-            atr_max_pct=safe_float(gv("atr_max_pct", "0.06"), 0.06),
-            atr_stop_mult=safe_float(gv("atr_stop_mult", "2.2"), 2.2),
-
-            adx_len=safe_int(gv("adx_len", "14"), 14),
-            adx_max_for_mr=safe_float(gv("adx_max_for_mr", "22.0"), 22.0),
-
-            confidence_min=safe_float(gv("confidence_min", "0.62"), 0.62),
-            max_bars_hold=safe_int(gv("max_bars_hold", "220"), 220),
-            take_partial_at_r=safe_float(gv("take_partial_at_r", "0.75"), 0.75),
-            partial_qty_frac=safe_float(gv("partial_qty_frac", "0.35"), 0.35),
-
-            min_r_vs_cost_mult=safe_float(gv("min_r_vs_cost_mult", "1.35"), 1.35),
-
-            lev_base=safe_float(gv("lev_base", "1.0"), 1.0),
-            lev_max=safe_float(gv("lev_max", "2.0"), 2.0),
-            lev_scale_by_signal=safe_float(gv("lev_scale_by_signal", "1.0"), 1.0),
-        ).sanitize()
-
-        return p
+        p = StrategyParamsV32(
+            z_lookback=gi("z_lookback", 60),
+            z_reentry=gf("z_reentry", 0.55),
+            z_neutral_band=gf("z_neutral_band", 0.35),
+            z_exit_revert=gf("z_exit_revert", 0.15),
+            vwap_lookback=gi("vwap_lookback", 80),
+            bb_len=gi("bb_len", 60),
+            bb_mult=gf("bb_mult", 1.6),
+            squeeze_bw_lookback=gi("squeeze_bw_lookback", 120),
+            squeeze_bw_mult=gf("squeeze_bw_mult", 0.80),
+            atr_len=gi("atr_len", 14),
+            atr_expand_mult=gf("atr_expand_mult", 1.15),
+            atr_min_pct=gf("atr_min_pct", 0.0010),
+            atr_max_pct=gf("atr_max_pct", 0.055),
+            atr_stop_mult=gf("atr_stop_mult", 1.35),
+            rsi_len=gi("rsi_len", 7),
+            rsi_min_for_long=gf("rsi_min_for_long", 52.0),
+            rsi_overheat=gf("rsi_overheat", 78.0),
+            adx_len=gi("adx_len", 14),
+            adx_min_rising=gf("adx_min_rising", 14.0),
+            adx_max_entry=gf("adx_max_entry", 38.0),
+            momentum_confirm_bars=gi("momentum_confirm_bars", 3),
+            cooldown_bars_after_exit=gi("cooldown_bars_after_exit", 6),
+            confidence_min=gf("confidence_min", 0.48),
+            max_bars_hold=gi("max_bars_hold", 140),
+            take_partial_at_r=gf("take_partial_at_r", 0.70),
+            partial_qty_frac=gf("partial_qty_frac", 0.40),
+            trail_atr_mult=gf("trail_atr_mult", 1.80),
+            min_r_vs_cost_mult=gf("min_r_vs_cost_mult", 1.10),
+            lev_base=gf("lev_base", 1.0),
+            lev_max=gf("lev_max", 1.6),
+            lev_scale_by_signal=gf("lev_scale_by_signal", 0.8),
+        )
+        return p.sanitize()
 
     def _apply_save_params(self) -> None:
         try:
-            p = self._params_from_gui()
-            self.engine.set_strategy_params(p, persist=True)
-            messagebox.showinfo("Strategy Params", "Applied and saved strategy parameters.")
-            self.log.info("GUI applied & saved strategy params.")
+            p = self._vars_to_params()
+            self.engine.save_params(p)
+            messagebox.showinfo("Strategy Params", "Saved strategy parameters.")
         except Exception as e:
-            self.log.exception("Apply/save params failed", e)
-            messagebox.showerror("Strategy Params", f"Failed to apply/save: {e}")
+            messagebox.showerror("Strategy Params", f"Failed to save: {e}")
 
     def _reload_params_from_engine(self) -> None:
         try:
-            p = self.engine.get_strategy_params().sanitize()
+            p = StrategyParamsV32.from_json(self.storage.get_gate(GATE_STRAT_PARAMS_JSON, "")).sanitize()
+            self.engine.params = p
             for k, v in dataclasses.asdict(p).items():
-                if k not in self._param_vars:
-                    self._param_vars[k] = tk.StringVar()
-                self._param_vars[k].set(str(v if not isinstance(v, bool) else (1 if v else 0)))
-            self.log.info("GUI reloaded params from engine.")
+                if k in self._param_vars:
+                    self._param_vars[k].set(str(v))
+            messagebox.showinfo("Strategy Params", "Reloaded saved parameters from DB.")
         except Exception as e:
-            self.log.warn(f"Reload params failed: {e}")
+            messagebox.showerror("Strategy Params", f"Failed to reload: {e}")
 
     def _reset_params_defaults(self) -> None:
         try:
-            p = StrategyParamsV3().sanitize()
-            self.engine.set_strategy_params(p, persist=True)
-            self._reload_params_from_engine()
-            messagebox.showinfo("Strategy Params", "Reset to defaults and saved.")
-            self.log.info("GUI reset params to defaults.")
+            p = StrategyParamsV32().sanitize()
+            self.engine.save_params(p)
+            for k, v in dataclasses.asdict(p).items():
+                if k in self._param_vars:
+                    self._param_vars[k].set(str(v))
+            messagebox.showinfo("Strategy Params", "Reset to defaults.")
         except Exception as e:
-            self.log.exception("Reset params failed", e)
-            messagebox.showerror("Strategy Params", f"Failed: {e}")
+            messagebox.showerror("Strategy Params", f"Failed to reset: {e}")
 
-    # ---- Controls ----
-
+    # ---------- Controls ----------
     def _start_engine(self) -> None:
         self.engine.start()
         self.log.info("GUI requested engine start")
@@ -2408,7 +2339,31 @@ class Dashboard(tk.Tk):
     def _open_reports_folder(self) -> None:
         open_folder_in_explorer(self.reports.reports_dir)
 
-    # ---- Backtest UI ----
+    # ---------- Backtest ----------
+    def _compose_backtest_summary_text(self) -> str:
+        ctx = self._last_backtest_context or {}
+        lines: list[str] = []
+        lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
+        lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        for k, v in ctx.items():
+            if k == "strategy_params_json":
+                continue
+            lines.append(f"{k}: {v}")
+        spj = ctx.get("strategy_params_json", "")
+        if spj:
+            lines.append("")
+            lines.append("Strategy Params (v0.3.2):")
+            lines.append(spj)
+        lines.append("")
+        lines.append("Top Results:")
+        for r in self._last_backtest_results[:10]:
+            lines.append(" - " + r.summary_line())
+        if self._last_backtest_report_paths:
+            lines.append("")
+            lines.append("Latest report files:")
+            for k, p in self._last_backtest_report_paths.items():
+                lines.append(f" - {k}: {p}")
+        return "\n".join(lines)
 
     def _copy_backtest_summary(self) -> None:
         if not self._last_backtest_results:
@@ -2422,36 +2377,6 @@ class Dashboard(tk.Tk):
             messagebox.showinfo("Copy Summary", "Copied backtest summary to clipboard. Paste it into chat.")
         except Exception as e:
             messagebox.showerror("Copy Summary", f"Failed: {e}")
-
-    def _compose_backtest_summary_text(self) -> str:
-        ctx = self._last_backtest_context or {}
-        lines: list[str] = []
-        lines.append(f"{APP_NAME} {APP_VERSION} BACKTEST SUMMARY")
-        lines.append(f"Generated: {now_utc().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        for k, v in ctx.items():
-            if k == "strategy_params":
-                continue
-            lines.append(f"{k}: {v}")
-
-        if "strategy_params" in ctx:
-            lines.append("")
-            lines.append("Strategy Params (v3):")
-            try:
-                params_pretty = json.dumps(ctx["strategy_params"], ensure_ascii=False, indent=2)
-                lines.extend(params_pretty.splitlines())
-            except Exception:
-                lines.append("(unavailable)")
-
-        lines.append("")
-        lines.append("Top Results:")
-        for r in self._last_backtest_results[:10]:
-            lines.append(" - " + r.summary_line())
-        if self._last_backtest_report_paths:
-            lines.append("")
-            lines.append("Latest report files:")
-            for k, p in self._last_backtest_report_paths.items():
-                lines.append(f" - {k}: {p}")
-        return "\n".join(lines)
 
     def _export_backtest_report(self) -> None:
         if not self._last_backtest_results:
@@ -2486,8 +2411,11 @@ class Dashboard(tk.Tk):
         eq = safe_float(self.var_bt_equity.get().strip(), 100.0)
         walk = bool(self.var_bt_walk.get())
 
-        # Freeze strategy params snapshot for report context
-        params_snapshot = dataclasses.asdict(self.engine.get_strategy_params().sanitize())
+        # Always save GUI params before running, so the backtest matches UI
+        try:
+            self.engine.save_params(self._vars_to_params())
+        except Exception as e:
+            messagebox.showwarning("Strategy Params", f"Could not save params; using last saved. ({e})")
 
         def worker() -> None:
             try:
@@ -2507,7 +2435,7 @@ class Dashboard(tk.Tk):
                     "paper_leverage_max": self.cfg.leverage_max,
                     "margin_alloc_cap": self.cfg.margin_alloc_cap,
                     "maint_margin_ratio": self.cfg.maint_margin_ratio,
-                    "strategy_params": params_snapshot,
+                    "strategy_params_json": self.engine.params.sanitize().to_json(),
                 }
                 self._last_backtest_results = res
                 self._last_backtest_context = ctx
@@ -2515,16 +2443,15 @@ class Dashboard(tk.Tk):
 
                 self._ui_queue.put(lambda: self._render_backtest_results(res))
 
-                # Conservative live gate (still not executing live in v0.3.1):
+                # Conservative live gate (still not executing live in v0.3.2):
                 if res:
                     top = res[0]
-                    gate_ok = (top.total_return > 0.10 and top.max_drawdown < 0.20 and top.trades >= 20)
-                    self.engine.storage.set_gate("LIVE_GATE", "1" if gate_ok else "0")
+                    gate_ok = (top.total_return > 0.10 and top.max_drawdown < 0.20 and top.trades >= 25 and top.win_rate >= 0.42)
+                    self.engine.storage.set_gate(GATE_LIVE_GATE, "1" if gate_ok else "0")
                     self.log.info(
                         f"Gate eval: top_return={fmt_pct(top.total_return)} dd={fmt_pct(top.max_drawdown)} "
-                        f"trades={top.trades} -> LIVE_GATE={int(gate_ok)}"
+                        f"trades={top.trades} win={top.win_rate*100:.1f}% -> LIVE_GATE={int(gate_ok)}"
                     )
-
             except Exception as e:
                 self.log.exception("Backtest worker failed", e)
 
@@ -2535,7 +2462,6 @@ class Dashboard(tk.Tk):
         tree: ttk.Treeview = self.tbl_bt.tree  # type: ignore[attr-defined]
         for item in tree.get_children():
             tree.delete(item)
-
         for r in results[:50]:
             tree.insert("", tk.END, values=(
                 r.pair,
@@ -2548,8 +2474,7 @@ class Dashboard(tk.Tk):
                 r.notes
             ))
 
-    # ---- Logs & status ----
-
+    # ---------- Logs / status ----------
     def _poll_logs(self) -> None:
         for _, line in self.log.drain(200):
             try:
